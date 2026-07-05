@@ -3,7 +3,14 @@
  */
 import { jest, describe, it, expect, beforeEach, afterEach } from '@jest/globals';
 import { render, screen, waitFor, fireEvent } from '@testing-library/react';
+import { TextDecoder as NodeTextDecoder } from 'node:util';
 import type { Job } from '@/types';
+
+// jest-environment-jsdom does not expose TextDecoder as a global; the component's
+// streaming reader uses it to decode Uint8Array chunks, so we polyfill it here.
+if (typeof (global as Record<string, unknown>).TextDecoder === 'undefined') {
+  (global as Record<string, unknown>).TextDecoder = NodeTextDecoder;
+}
 
 // ── Module mocks (must be registered before dynamic import of InterviewRoom) ───
 
@@ -76,10 +83,29 @@ function makeInterviewResponse(
   nextQuestion = 'Next question',
   isComplete = false
 ): Response {
+  const text = isComplete ? `${nextQuestion}[INTERVIEW_COMPLETE]` : nextQuestion;
+  // Use Node's Buffer (always available) instead of TextEncoder (not in jsdom).
+  // TextDecoder.decode() accepts any BufferSource including Buffer/Uint8Array.
+  const encoded = Buffer.from(text, 'utf8') as unknown as Uint8Array;
+  let readCalled = false;
+  // Duck-typed ReadableStreamDefaultReader — jsdom does not expose ReadableStream
+  // globally, so we build an object that satisfies the interface InterviewRoom uses:
+  // res.body.getReader() → reader; reader.read() → { done, value }
+  const body = {
+    getReader: () => ({
+      read: (): Promise<{ done: boolean; value: Uint8Array | undefined }> => {
+        if (!readCalled) {
+          readCalled = true;
+          return Promise.resolve({ done: false, value: encoded });
+        }
+        return Promise.resolve({ done: true, value: undefined });
+      },
+    }),
+  };
   return {
     ok: true,
     status: 200,
-    json: () => Promise.resolve({ nextQuestion, isComplete }),
+    body,
   } as unknown as Response;
 }
 
@@ -101,19 +127,31 @@ describe('InterviewRoom', () => {
       configurable: true,
     });
 
-    // Mock SpeechSynthesisUtterance — not available in jsdom
-    if (!('SpeechSynthesisUtterance' in window)) {
-      Object.defineProperty(window, 'SpeechSynthesisUtterance', {
-        value: class MockSpeechSynthesisUtterance {
-          text: string;
-          constructor(text: string) {
-            this.text = text;
-          }
-        },
-        writable: true,
-        configurable: true,
-      });
-    }
+    // Mock SpeechSynthesisUtterance with onstart/onend support — not available in jsdom
+    Object.defineProperty(window, 'SpeechSynthesisUtterance', {
+      value: class MockSpeechSynthesisUtterance {
+        text: string;
+        onstart: (() => void) | null = null;
+        onend: (() => void) | null = null;
+        constructor(text: string) {
+          this.text = text;
+        }
+      },
+      writable: true,
+      configurable: true,
+    });
+
+    // Mock navigator.mediaDevices — not available in jsdom; simulate denial so
+    // the camera useEffect runs and catches the rejection silently.
+    Object.defineProperty(navigator, 'mediaDevices', {
+      value: {
+        getUserMedia: jest
+          .fn()
+          .mockImplementation(() => Promise.reject(new DOMException('Permission denied'))),
+      },
+      writable: true,
+      configurable: true,
+    });
 
     // Mock scrollIntoView — not implemented in jsdom
     window.HTMLElement.prototype.scrollIntoView = () => {};
@@ -267,5 +305,66 @@ describe('InterviewRoom', () => {
     await waitFor(() => {
       expect(screen.getByText('Interview complete.')).toBeInTheDocument();
     });
+  });
+
+  // ── 9. Next question displayed in question panel after non-complete stream ───
+
+  it('displays next question in panel after streaming a non-complete turn', async () => {
+    const NEXT_Q = 'Tell me about a challenge you faced.';
+    const mockFetch = createFetchMock();
+    mockFetch
+      .mockResolvedValueOnce(makeSessionResponse())
+      .mockResolvedValueOnce(makeInterviewResponse(NEXT_Q, false));
+    global.fetch = mockFetch;
+
+    render(<InterviewRoom job={VALID_JOB} />);
+
+    // Wait for awaiting_recording phase
+    await waitFor(() => {
+      expect(screen.getByTestId('mock-record-button')).toBeInTheDocument();
+    });
+
+    // Trigger transcript → processing → TURN_SAVED with isComplete = false
+    fireEvent.click(screen.getByTestId('mock-record-button'));
+
+    // Component should transition back to awaiting_recording and show the next question
+    await waitFor(() => {
+      expect(screen.getByText(NEXT_Q)).toBeInTheDocument();
+    });
+
+    // Verify component is NOT in complete phase
+    expect(screen.queryByText('Interview complete.')).not.toBeInTheDocument();
+  });
+
+  // ── 10. Job title in header bar after session creation ───────────────────────
+
+  it('renders job title in header bar after session creation', async () => {
+    const mockFetch = createFetchMock();
+    mockFetch.mockResolvedValue(makeSessionResponse());
+    global.fetch = mockFetch;
+
+    render(<InterviewRoom job={VALID_JOB} />);
+
+    await waitFor(() => {
+      expect(screen.getByText(VALID_JOB.title)).toBeInTheDocument();
+    });
+  });
+
+  // ── 10. CallTimer renders "00:00" and has aria-label after session creation ───
+
+  it('CallTimer renders "00:00" and has aria-label="Elapsed interview time" after session creation', async () => {
+    const mockFetch = createFetchMock();
+    mockFetch.mockResolvedValue(makeSessionResponse());
+    global.fetch = mockFetch;
+
+    const { container } = render(<InterviewRoom job={VALID_JOB} />);
+
+    await waitFor(() => {
+      const timerEl = container.querySelector('[aria-label="Elapsed interview time"]');
+      expect(timerEl).toBeInTheDocument();
+    });
+
+    const timerEl = container.querySelector('[aria-label="Elapsed interview time"]');
+    expect(timerEl).toHaveTextContent('00:00');
   });
 });

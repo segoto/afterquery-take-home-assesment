@@ -45,10 +45,7 @@ export default async function InterviewPage({
   };
 
   return (
-    <main className="flex min-h-screen flex-col p-8 max-w-2xl mx-auto">
-      <h1 className="text-2xl font-semibold text-zinc-900 mb-6">
-        {job.title} Interview
-      </h1>
+    <main className="min-h-screen bg-zinc-950 text-white flex flex-col">
       <InterviewRoom job={jobForClient} />
     </main>
   );
