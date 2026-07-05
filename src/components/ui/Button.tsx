@@ -1,6 +1,7 @@
 'use client';
 
 import React from 'react';
+import Link from 'next/link';
 
 export interface ButtonProps {
   variant?: 'primary' | 'secondary';
@@ -10,6 +11,8 @@ export interface ButtonProps {
   onClick?: () => void;
   children: React.ReactNode;
   className?: string;
+  'aria-label'?: string;
+  href?: string;
 }
 
 function Spinner() {
@@ -46,6 +49,8 @@ export function Button({
   onClick,
   children,
   className = '',
+  'aria-label': ariaLabel,
+  href,
 }: ButtonProps) {
   const base =
     'inline-flex items-center justify-center rounded-md px-4 py-2 text-sm font-medium transition-colors focus:outline-none focus:ring-2 focus:ring-zinc-500 focus:ring-offset-2';
@@ -58,11 +63,23 @@ export function Button({
   const disabledClasses =
     !loading && disabled ? 'opacity-50 cursor-not-allowed' : '';
 
+  if (href) {
+    return (
+      <Link
+        href={href}
+        className={[base, variants[variant], className].filter(Boolean).join(' ')}
+      >
+        {children}
+      </Link>
+    );
+  }
+
   return (
     <button
       type={type}
       disabled={disabled || loading}
       onClick={onClick}
+      aria-label={ariaLabel}
       className={[base, variants[variant], disabledClasses, className]
         .filter(Boolean)
         .join(' ')}

@@ -461,5 +461,166 @@ paths:
                     type: string
                     example: "Internal server error"
 
+  /api/sessions:
+    post:
+      summary: Create a new interview session
+      operationId: createSession
+      tags: [sessions]
+      security:
+        - cookieAuth: []
+      description: |
+        Creates a new `Session` row tied to the given `jobId` and the authenticated
+        user (extracted from the `auth_token` cookie). If the cookie is missing or
+        invalid the session is still created with `userId = null` — the auth
+        middleware already protects this route. Returns `201` with the new session id.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [jobId]
+              properties:
+                jobId:
+                  type: string
+                  description: The cuid id of an existing Job row.
+                  example: clswe0001000000000000000001
+      responses:
+        '201':
+          description: Session created successfully.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id]
+                properties:
+                  id:
+                    type: string
+                    example: clsession000000000000000001
+        '400':
+          description: Validation error — jobId is missing, not a string, or empty.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+                    example: "jobId is required"
+        '404':
+          description: No Job row found with the provided jobId.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+                    example: "Job not found"
+        '500':
+          description: Unexpected server error.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+                    example: "Internal server error"
+
+  /api/interview:
+    post:
+      summary: Submit a user's interview answer and receive the next question
+      operationId: submitInterviewTurn
+      tags: [interview]
+      security:
+        - cookieAuth: []
+      description: |
+        Accepts the candidate's spoken answer for the current turn. Validates the session
+        is IN_PROGRESS, persists two Turn rows (AI question + user answer) in a single
+        transaction, and returns a hardcoded next question. The `turnNumber` field is used
+        to index into the server-side placeholder question list; out-of-bounds indices fall
+        back to index 0.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sessionId, userAnswer, turnNumber]
+              properties:
+                sessionId:
+                  type: string
+                  example: clyyyy
+                userAnswer:
+                  type: string
+                  example: I have 5 years of experience building distributed systems.
+                turnNumber:
+                  type: integer
+                  minimum: 0
+                  example: 0
+      responses:
+        '200':
+          description: Turn persisted. Returns the next question and a completion flag.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [nextQuestion, isComplete]
+                properties:
+                  nextQuestion:
+                    type: string
+                    example: "Thank you. Can you walk me through a specific challenge you faced in a previous role and how you resolved it?"
+                  isComplete:
+                    type: boolean
+                    example: false
+        '400':
+          description: Validation error — missing or invalid field.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+                    example: "sessionId, userAnswer, and turnNumber are required"
+        '404':
+          description: Session not found.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+                    example: "Session not found"
+        '409':
+          description: Session is not in progress (COMPLETED or ABANDONED).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+                    example: "Session is not in progress"
+        '500':
+          description: Unexpected server error.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+                    example: "Internal server error"
+
 # Additional endpoints are added here by backend-implementer agents as features are built.
 # Each entry must include: summary, operationId, request body schema, response schemas, and error cases.

@@ -55,4 +55,36 @@ describe('Button', () => {
     render(<Button className="extra-class">Custom</Button>);
     expect(screen.getByRole('button').className).toContain('extra-class');
   });
+
+  describe('when href is provided', () => {
+    it('renders an <a> element instead of a <button>', () => {
+      render(<Button href="/foo">Go</Button>);
+      expect(screen.getByRole('link', { name: 'Go' })).toBeInTheDocument();
+      expect(screen.queryByRole('button')).not.toBeInTheDocument();
+    });
+
+    it('the rendered <a> has the correct href', () => {
+      render(<Button href="/foo">Go</Button>);
+      expect(screen.getByRole('link', { name: 'Go' })).toHaveAttribute('href', '/foo');
+    });
+
+    it('the rendered <a> has primary variant classes by default', () => {
+      render(<Button href="/foo">Go</Button>);
+      const link = screen.getByRole('link', { name: 'Go' });
+      expect(link.className).toContain('bg-zinc-900');
+      expect(link.className).toContain('text-white');
+    });
+
+    it('the rendered <a> has secondary variant classes when variant="secondary"', () => {
+      render(<Button href="/foo" variant="secondary">Go</Button>);
+      const link = screen.getByRole('link', { name: 'Go' });
+      expect(link.className).toContain('border');
+      expect(link.className).toContain('text-zinc-900');
+    });
+
+    it('the rendered <a> includes a custom className when provided', () => {
+      render(<Button href="/foo" className="my-custom-class">Go</Button>);
+      expect(screen.getByRole('link', { name: 'Go' }).className).toContain('my-custom-class');
+    });
+  });
 });

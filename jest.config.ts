@@ -22,6 +22,11 @@ const config: Config = {
     ],
   },
   setupFilesAfterEnv: ['<rootDir>/src/__tests__/setup.ts'],
+  testPathIgnorePatterns: [
+    '/node_modules/',
+    '<rootDir>/src/__tests__/setup\\.ts$',
+    '<rootDir>/src/__tests__/jest\\.d\\.ts$',
+  ],
 };
 
 export default config;
