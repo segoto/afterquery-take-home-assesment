@@ -622,5 +622,128 @@ paths:
                     type: string
                     example: "Internal server error"
 
+  /api/sessions/{sessionId}:
+    patch:
+      summary: Mark an in-progress session as ABANDONED
+      operationId: abandonSession
+      tags: [sessions]
+      security:
+        - cookieAuth: []
+      description: |
+        Marks an in-progress interview session as ABANDONED. The caller must be the
+        authenticated owner of the session (verified via the `auth_token` cookie).
+        Sets `ended_at` to the current timestamp. Returns 409 if the session is
+        already COMPLETED or ABANDONED.
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          description: The cuid id of the session to abandon.
+          schema:
+            type: string
+            example: clsession000000000000000001
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status:
+                  type: string
+                  enum: [ABANDONED]
+                  example: ABANDONED
+      responses:
+        '200':
+          description: Session successfully marked as ABANDONED.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, status]
+                properties:
+                  id:
+                    type: string
+                    example: clsession000000000000000001
+                  status:
+                    type: string
+                    enum: [ABANDONED]
+                    example: ABANDONED
+        '400':
+          description: Validation error — body is not valid JSON or status is not ABANDONED.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+              examples:
+                invalidBody:
+                  summary: Request body is not valid JSON
+                  value:
+                    error: "Invalid request body"
+                wrongStatus:
+                  summary: status field is not ABANDONED
+                  value:
+                    error: "status must be ABANDONED"
+        '401':
+          description: Missing or invalid auth_token cookie.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+                    example: "Unauthorized"
+        '403':
+          description: Session belongs to a different user.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+                    example: "Forbidden"
+        '404':
+          description: No session found with the provided sessionId.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+                    example: "Session not found"
+        '409':
+          description: Session is already COMPLETED or ABANDONED (not IN_PROGRESS).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+                    example: "Session is not in progress"
+        '500':
+          description: Unexpected server error.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+                    example: "Internal server error"
+
 # Additional endpoints are added here by backend-implementer agents as features are built.
 # Each entry must include: summary, operationId, request body schema, response schemas, and error cases.

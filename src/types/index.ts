@@ -60,7 +60,25 @@ export interface TranscriptTurn {
   id: string;
   speaker: Speaker;
   content: string;
-  createdAt: Date;
+  createdAt: string | Date;
+}
+
+export interface SessionListItem {
+  id: string;
+  status: SessionStatus;
+  startedAt: string; // ISO 8601
+  endedAt: string | null; // ISO 8601
+  job: {
+    id: string;
+    title: string;
+  };
+  turnCount: number;
+  evaluationScore: number | null;
+}
+
+export interface PatchSessionResponse {
+  id: string;
+  status: 'ABANDONED';
 }
 
 export type InterviewPhase =

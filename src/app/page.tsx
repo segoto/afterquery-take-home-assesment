@@ -1,11 +1,10 @@
 import { cookies } from 'next/headers';
 import { redirect } from 'next/navigation';
-import Link from 'next/link';
 import { verifyToken } from '@/lib/auth';
 import { prisma } from '@/lib/prisma';
-import { Card } from '@/components/ui/Card';
-import { Button } from '@/components/ui/Button';
 import { LogoutButton } from '@/components/LogoutButton';
+import { SessionListItem } from '@/types';
+import { DashboardTabs } from '@/components/DashboardTabs';
 
 export default async function Home() {
   const cookieStore = await cookies();
@@ -15,12 +14,38 @@ export default async function Home() {
   if (!payload) redirect('/login');
 
   let jobs: { id: string; title: string; description: string }[] = [];
-  let dbError = false;
+  let jobsError = false;
   try {
     jobs = await prisma.job.findMany({ orderBy: { createdAt: 'asc' } });
   } catch (err) {
     console.error('[page] Failed to load jobs:', err);
-    dbError = true;
+    jobsError = true;
+  }
+
+  let sessions: SessionListItem[] = [];
+  let sessionsError = false;
+  try {
+    const rawSessions = await prisma.session.findMany({
+      where: { userId: payload.sub },
+      include: {
+        job: { select: { id: true, title: true } },
+        evaluation: { select: { score: true } },
+        _count: { select: { turns: true } },
+      },
+      orderBy: { startedAt: 'desc' },
+    });
+    sessions = rawSessions.map((s) => ({
+      id: s.id,
+      status: s.status,
+      startedAt: s.startedAt.toISOString(),
+      endedAt: s.endedAt?.toISOString() ?? null,
+      job: s.job,
+      turnCount: s._count.turns,
+      evaluationScore: s.evaluation?.score ?? null,
+    }));
+  } catch (err) {
+    console.error('[page] Failed to load sessions:', err);
+    sessionsError = true;
   }
 
   return (
@@ -33,27 +58,12 @@ export default async function Home() {
         </div>
       </header>
       <main className="flex-1 max-w-6xl mx-auto w-full px-4 py-8">
-        <h1 className="text-2xl font-bold text-zinc-900 mb-6">Available Positions</h1>
-        {dbError ? (
-          <p className="text-zinc-500 text-center py-12">
-            Unable to load positions. Please try again later.{' '}
-            <Link href="/" className="underline text-zinc-700">Refresh</Link>
-          </p>
-        ) : jobs.length === 0 ? (
-          <p className="text-zinc-500 text-center py-12">No positions available at this time.</p>
-        ) : (
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
-            {jobs.map((job) => (
-              <Card key={job.id}>
-                <h2 className="font-semibold text-lg text-zinc-900">{job.title}</h2>
-                <p className="text-sm text-zinc-600 mt-2 line-clamp-3">{job.description}</p>
-                <Button href={`/interview/${job.id}`} variant="primary" className="mt-4 w-full">
-                  Start Interview
-                </Button>
-              </Card>
-            ))}
-          </div>
-        )}
+        <DashboardTabs
+          jobs={jobs}
+          jobsError={jobsError}
+          sessions={sessions}
+          sessionsError={sessionsError}
+        />
       </main>
     </div>
   );

@@ -8,6 +8,9 @@ const mockRedirect = jest.fn<(url: string) => never>();
 const mockCookiesGet = jest.fn<() => { value: string } | undefined>();
 const mockVerifyToken = jest.fn<() => Promise<{ sub: string; email: string } | null>>();
 const mockJobFindMany = jest.fn<() => Promise<Array<{ id: string; title: string; description: string }>>>();
+const mockSessionFindMany = jest.fn<(args: Record<string, unknown>) => Promise<Array<Record<string, unknown>>>>();
+
+const mockDashboardTabs = jest.fn<(props: Record<string, unknown>) => React.ReactElement>();
 
 jest.unstable_mockModule('next/headers', () => ({
   cookies: jest.fn(async () => ({ get: mockCookiesGet })),
@@ -25,6 +28,9 @@ jest.unstable_mockModule('@/lib/prisma', () => ({
   prisma: {
     job: {
       findMany: mockJobFindMany,
+    },
+    session: {
+      findMany: mockSessionFindMany,
     },
   },
 }));
@@ -71,6 +77,10 @@ jest.unstable_mockModule('@/components/ui/Card', () => ({
   }) => React.createElement('div', { className }, children),
 }));
 
+jest.unstable_mockModule('@/components/DashboardTabs', () => ({
+  DashboardTabs: mockDashboardTabs,
+}));
+
 const { render, screen } = await import('@testing-library/react');
 const { default: HomePage } = await import('@/app/page');
 
@@ -95,6 +105,10 @@ describe('HomePage', () => {
     mockCookiesGet.mockReturnValue({ value: 'valid-token' });
     mockVerifyToken.mockResolvedValue(VALID_PAYLOAD);
     mockJobFindMany.mockResolvedValue(SAMPLE_JOBS);
+    mockSessionFindMany.mockResolvedValue([]);
+    mockDashboardTabs.mockImplementation(() =>
+      React.createElement('div', { 'data-testid': 'dashboard-tabs' }),
+    );
   });
 
   afterEach(() => {
@@ -115,14 +129,13 @@ describe('HomePage', () => {
     expect(mockRedirect).toHaveBeenCalledWith('/login');
   });
 
-  it('renders h1 "Available Positions" and job titles when authenticated', async () => {
+  it('renders DashboardTabs with jobs and no jobsError when authenticated', async () => {
     await renderPage();
 
-    expect(
-      screen.getByRole('heading', { level: 1, name: /available positions/i }),
-    ).toBeInTheDocument();
-    expect(screen.getByRole('heading', { level: 2, name: /software engineer/i })).toBeInTheDocument();
-    expect(screen.getByRole('heading', { level: 2, name: /product manager/i })).toBeInTheDocument();
+    expect(screen.getByTestId('dashboard-tabs')).toBeInTheDocument();
+    const props = mockDashboardTabs.mock.calls[0][0] as Record<string, unknown>;
+    expect(props.jobs).toEqual(SAMPLE_JOBS);
+    expect(props.jobsError).toBe(false);
   });
 
   it('renders the user email in the header when authenticated', async () => {
@@ -131,21 +144,61 @@ describe('HomePage', () => {
     expect(screen.getByText('test@example.com')).toBeInTheDocument();
   });
 
-  it('renders "No positions available at this time." when findMany returns empty array', async () => {
+  it('passes empty jobs array and jobsError=false to DashboardTabs when findMany returns empty array', async () => {
     mockJobFindMany.mockResolvedValue([]);
 
     await renderPage();
 
-    expect(screen.getByText(/no positions available at this time/i)).toBeInTheDocument();
+    const props = mockDashboardTabs.mock.calls[0][0] as Record<string, unknown>;
+    expect(props.jobs).toEqual([]);
+    expect(props.jobsError).toBe(false);
   });
 
-  it('renders error state and calls console.error when findMany throws', async () => {
+  it('passes jobsError=true to DashboardTabs and calls console.error when findMany throws', async () => {
     const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
     mockJobFindMany.mockRejectedValue(new Error('DB connection error'));
 
     await renderPage();
 
-    expect(screen.getByText(/unable to load positions/i)).toBeInTheDocument();
     expect(consoleErrorSpy).toHaveBeenCalled();
+    const props = mockDashboardTabs.mock.calls[0][0] as Record<string, unknown>;
+    expect(props.jobsError).toBe(true);
+  });
+
+  it('sessions query is called with userId from JWT payload', async () => {
+    await renderPage();
+
+    expect(mockSessionFindMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { userId: 'user-1' },
+        include: expect.objectContaining({
+          job: { select: { id: true, title: true } },
+          evaluation: { select: { score: true } },
+          _count: { select: { turns: true } },
+        }),
+        orderBy: { startedAt: 'desc' },
+      }),
+    );
+  });
+
+  it('sessions error sets sessionsError=true', async () => {
+    mockSessionFindMany.mockRejectedValue(new Error('DB error'));
+
+    await renderPage();
+
+    const props = mockDashboardTabs.mock.calls[0][0] as Record<string, unknown>;
+    expect(props.sessionsError).toBe(true);
+  });
+
+  it('both queries fail independently', async () => {
+    mockJobFindMany.mockRejectedValue(new Error('jobs DB error'));
+    mockSessionFindMany.mockRejectedValue(new Error('sessions DB error'));
+
+    await renderPage();
+
+    expect(screen.getByTestId('dashboard-tabs')).toBeInTheDocument();
+    const props = mockDashboardTabs.mock.calls[0][0] as Record<string, unknown>;
+    expect(props.jobsError).toBe(true);
+    expect(props.sessionsError).toBe(true);
   });
 });
