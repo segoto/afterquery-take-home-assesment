@@ -23,6 +23,8 @@ model Session {
   id         String        @id @default(cuid())
   jobId      String        @map("job_id")
   job        Job           @relation(fields: [jobId], references: [id])
+  userId     String?       @map("user_id")
+  user       User?         @relation(fields: [userId], references: [id])
   startedAt  DateTime      @default(now()) @map("started_at")
   endedAt    DateTime?     @map("ended_at")
   status     SessionStatus @default(IN_PROGRESS)
@@ -64,4 +66,25 @@ model Evaluation {
   createdAt DateTime @default(now()) @map("created_at")
 
   @@map("evaluations")
+}
+
+model User {
+  id           String    @id @default(cuid())
+  email        String    @unique
+  passwordHash String    @map("password_hash")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+  sessions     Session[]
+
+  @@map("users")
+}
+
+model PasswordResetToken {
+  id        String   @id @default(cuid())
+  token     String   @unique
+  email     String
+  expiresAt DateTime @map("expires_at")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@map("password_reset_tokens")
 }

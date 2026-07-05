@@ -12,6 +12,16 @@ servers:
   - url: https://<your-vercel-url>
     description: Production (Vercel)
 
+security: []
+
+components:
+  securitySchemes:
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: auth_token
+      description: HttpOnly JWT cookie set on login or signup. Required for protected endpoints.
+
 tags:
   - name: sessions
     description: Interview session lifecycle
@@ -19,7 +29,437 @@ tags:
     description: AI turn-taking during an active interview
   - name: evaluate
     description: Post-interview structured evaluation
+  - name: auth
+    description: Authentication — signup, login, logout, JWT session, and password reset
 
-paths: {}
-# Endpoints are added here by backend-implementer agents as features are built.
+paths:
+  /api/auth/signup:
+    post:
+      summary: Create a new user account
+      operationId: signupUser
+      tags: [auth]
+      description: |
+        Registers a new user with an email address and password. Validates that
+        all fields are present, that the password is at least 8 characters, and
+        that `password` matches `confirmPassword`. On success, creates a `User`
+        row (password hashed with bcrypt cost factor 12), signs a 7-day JWT,
+        sets an `auth_token` HttpOnly cookie, and returns `201` with the new
+        user's `id` and `email`. Returns `409` if the email is already registered.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password, confirmPassword]
+              properties:
+                email:
+                  type: string
+                  format: email
+                  example: user@example.com
+                password:
+                  type: string
+                  format: password
+                  minLength: 8
+                  example: secret123
+                confirmPassword:
+                  type: string
+                  format: password
+                  minLength: 8
+                  example: secret123
+      responses:
+        '201':
+          description: Account created. Sets `auth_token` HttpOnly cookie (Max-Age=604800).
+          headers:
+            Set-Cookie:
+              description: "auth_token=<jwt>; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800"
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, email]
+                properties:
+                  id:
+                    type: string
+                    example: clxxx
+                  email:
+                    type: string
+                    format: email
+                    example: user@example.com
+        '400':
+          description: Validation error — missing field, password too short, or passwords do not match.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+              examples:
+                emailRequired:
+                  summary: Email is missing
+                  value:
+                    error: "Email is required"
+                passwordTooShort:
+                  summary: Password is shorter than 8 characters
+                  value:
+                    error: "Password must be at least 8 characters"
+                passwordsMismatch:
+                  summary: Passwords do not match
+                  value:
+                    error: "Passwords do not match"
+        '409':
+          description: Email address is already registered.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+                    example: "Email already registered"
+        '500':
+          description: Unexpected server error.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+                    example: "Internal server error"
+
+  /api/auth/login:
+    post:
+      summary: Log in with email and password
+      operationId: loginUser
+      tags: [auth]
+      description: |
+        Authenticates a user with their email and password.
+        On success, sets an `auth_token` HttpOnly cookie containing a signed JWT
+        (HS256, 7-day expiry). Returns the authenticated user's `id` and `email`.
+        Both "email not found" and "wrong password" cases return the same
+        `401 { error: "Invalid credentials" }` response to prevent email enumeration.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email:
+                  type: string
+                  format: email
+                  example: user@example.com
+                password:
+                  type: string
+                  format: password
+                  example: secret123
+      responses:
+        '200':
+          description: Login successful. Sets `auth_token` HttpOnly cookie (Max-Age=604800).
+          headers:
+            Set-Cookie:
+              description: "auth_token=<jwt>; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800"
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, email]
+                properties:
+                  id:
+                    type: string
+                    example: clxxx
+                  email:
+                    type: string
+                    format: email
+                    example: user@example.com
+        '400':
+          description: Missing email or password field.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+                    example: "Email and password are required"
+        '401':
+          description: Email not found or password incorrect (same message in both cases).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+                    example: "Invalid credentials"
+        '500':
+          description: Unexpected server error.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+                    example: "Internal server error"
+
+  /api/auth/forgot-password:
+    post:
+      summary: Request a password reset token
+      operationId: forgotPassword
+      tags:
+        - auth
+      description: |
+        Accepts an email address. If the email is registered, deletes any existing
+        reset tokens for that address, generates a new cryptographically random
+        64-character hex token (32 bytes via Node.js crypto), stores it with a
+        1-hour expiry, and returns `{ token }`. If the email is NOT registered,
+        returns `{ token: null }` with the same 200 status to prevent email
+        enumeration.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - email
+              properties:
+                email:
+                  type: string
+                  format: email
+                  example: user@example.com
+      responses:
+        '200':
+          description: |
+            Always returned regardless of whether the email exists. When the email
+            is registered, `token` is a 64-character hex string the client uses to
+            redirect to /reset-password?token=<token>. When the email is not
+            registered, `token` is null.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - token
+                properties:
+                  token:
+                    oneOf:
+                      - type: string
+                        example: a3f2b1c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2
+                      - type: 'null'
+        '400':
+          description: Email field is missing or empty.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - error
+                properties:
+                  error:
+                    type: string
+                    example: Email is required
+        '500':
+          description: Unexpected server error.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - error
+                properties:
+                  error:
+                    type: string
+                    example: Internal server error
+
+  /api/auth/reset-password:
+    post:
+      summary: Reset a user's password using a valid reset token
+      operationId: resetPassword
+      tags:
+        - auth
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - token
+                - password
+                - confirmPassword
+              properties:
+                token:
+                  type: string
+                  description: The 64-character hex reset token from the forgot-password response
+                  example: a3f2b1c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2
+                password:
+                  type: string
+                  minLength: 8
+                  description: The new password (minimum 8 characters)
+                  example: newsecurepassword
+                confirmPassword:
+                  type: string
+                  description: Must match the password field
+                  example: newsecurepassword
+      responses:
+        '200':
+          description: Password successfully reset
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success]
+                properties:
+                  success:
+                    type: boolean
+                    enum:
+                      - true
+                example:
+                  success: true
+        '400':
+          description: Validation error or invalid/expired token
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+              examples:
+                tokenRequired:
+                  summary: Token is missing
+                  value:
+                    error: Token is required
+                passwordTooShort:
+                  summary: Password is too short
+                  value:
+                    error: Password must be at least 8 characters
+                passwordsMismatch:
+                  summary: Passwords do not match
+                  value:
+                    error: Passwords do not match
+                invalidToken:
+                  summary: Token not found or expired
+                  value:
+                    error: Invalid or expired reset token
+        '500':
+          description: Unexpected server error
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+              example:
+                error: Internal server error
+
+  /api/auth/logout:
+    post:
+      summary: Log out the current user
+      operationId: logoutUser
+      tags: [auth]
+      security: []
+      description: |
+        Clears the `auth_token` HttpOnly cookie by setting it with `Max-Age=0`.
+        No request body is required. No database query is performed.
+      responses:
+        '200':
+          description: Logout successful. Clears the `auth_token` cookie.
+          headers:
+            Set-Cookie:
+              description: "auth_token=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0"
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success]
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                    example: true
+        '500':
+          description: Unexpected server error.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+                    example: "Internal server error"
+
+  /api/auth/me:
+    get:
+      summary: Get the currently authenticated user
+      operationId: getMe
+      tags: [auth]
+      security:
+        - cookieAuth: []
+      description: |
+        Reads the `auth_token` cookie from the request, verifies the JWT,
+        and returns the authenticated user's `id` and `email`.
+        If the cookie is absent, expired, or invalid — or if the user no longer
+        exists in the database — returns `401 { error: "Unauthenticated" }`.
+      responses:
+        '200':
+          description: Authenticated user details.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, email]
+                properties:
+                  id:
+                    type: string
+                    example: clxxx
+                  email:
+                    type: string
+                    format: email
+                    example: user@example.com
+        '401':
+          description: Cookie absent, JWT invalid/expired, or user deleted.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+                    example: "Unauthenticated"
+        '500':
+          description: Unexpected server error.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+                    example: "Internal server error"
+
+# Additional endpoints are added here by backend-implementer agents as features are built.
 # Each entry must include: summary, operationId, request body schema, response schemas, and error cases.
