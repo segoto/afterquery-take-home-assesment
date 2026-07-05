@@ -7,16 +7,54 @@ datasource db {
   provider = "postgresql"
 }
 
+enum Seniority {
+  JUNIOR
+  MID
+  SENIOR
+}
+
+enum QuestionType {
+  TECHNICAL
+  BEHAVIORAL
+  SITUATIONAL
+}
+
 model Job {
   id           String    @id @default(cuid())
   slug         String    @unique
   title        String
   description  String
   questionPack Json?     @map("question_pack")
+  seniority    Seniority @default(MID)
+  skills       Skill[]
   sessions     Session[]
   createdAt    DateTime  @default(now()) @map("created_at")
 
   @@map("jobs")
+}
+
+model Skill {
+  id        String     @id @default(cuid())
+  jobId     String     @map("job_id")
+  name      String
+  weight    Int        @default(1)
+  questions Question[]
+  job       Job        @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  @@unique([jobId, name])
+  @@map("skills")
+}
+
+model Question {
+  id        String       @id @default(cuid())
+  skillId   String       @map("skill_id")
+  text      String
+  seniority Seniority?
+  type      QuestionType
+  skill     Skill        @relation(fields: [skillId], references: [id], onDelete: Cascade)
+  createdAt DateTime     @default(now()) @map("created_at")
+
+  @@map("questions")
 }
 
 model Session {
