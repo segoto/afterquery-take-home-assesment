@@ -1,0 +1,25 @@
+openapi: 3.1.0
+info:
+  title: AI Interviewer Platform API
+  version: 0.1.0
+  description: |
+    REST API for the AI Interviewer Platform.
+    All endpoints are Next.js App Router route handlers under /api/.
+
+servers:
+  - url: http://localhost:3000
+    description: Local development
+  - url: https://<your-vercel-url>
+    description: Production (Vercel)
+
+tags:
+  - name: sessions
+    description: Interview session lifecycle
+  - name: interview
+    description: AI turn-taking during an active interview
+  - name: evaluate
+    description: Post-interview structured evaluation
+
+paths: {}
+# Endpoints are added here by backend-implementer agents as features are built.
+# Each entry must include: summary, operationId, request body schema, response schemas, and error cases.

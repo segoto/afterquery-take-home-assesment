@@ -123,6 +123,69 @@ NEXT_PUBLIC_APP_URL=         # Used for absolute URLs (e.g. OG images)
 
 See `.env.example` for the full list.
 
+## Hard rules — never violate these
+
+- **Database column and table names must always be snake_case.** Use `@map("snake_case_name")` on every camelCase field and `@@map("snake_case_table")` on every model. The Prisma model and field names in TypeScript stay camelCase; only the DB-level names are affected.
+- **All features are built through the SDD pipeline.** No code is written directly — every feature starts with the `orchestrator` agent. See [SDD workflow](#spec-driven-development-sdd-workflow) below.
+- **No agent pastes file contents in its response.** Every agent communicates only via `Status: <STATUS> | File: <path>` lines. Full content lives in md files.
+- **Shared UI primitives only.** All reusable elements (Button, Card, Input, etc.) live in `src/components/ui/`. No page component defines its own button or input styles inline.
+
+## Spec-Driven Development (SDD) workflow
+
+All features in this project are built through a pipeline of specialized agents. To start a feature:
+
+1. Spawn the `orchestrator` agent with your feature request.
+2. The orchestrator drives the full pipeline automatically.
+
+### Pipeline order
+
+```
+orchestrator
+  └─► feature-spec-planner        writes sdd/<feature>/feature-spec.md
+        └─► feature-spec-evaluator  writes sdd/<feature>/reviews/spec-evaluation.md
+  └─► implementation-planner      writes sdd/<feature>/implementation-plan.md
+  └─► implementation-orchestrator
+        ├─► backend-implementer (per backend task)
+        │     └─► backend-code-reviewer
+        └─► frontend-implementer (per frontend task)
+              └─► frontend-code-reviewer
+```
+
+### Persistent artifacts (never delete)
+
+| File | Created by | Purpose |
+|------|-----------|---------|
+| `sdd/<feature>/feature-spec.md` | feature-spec-planner | Approved feature specification |
+| `sdd/<feature>/implementation-plan.md` | implementation-planner | Task graph and implementation notes |
+| `sdd/summary.md` | orchestrator | Index of all completed features |
+
+### Temporary artifacts (deleted by orchestrator when feature is done)
+
+- `sdd/<feature>/reviews/` — all review and evaluation files
+
+### Agent communication protocol
+
+Every agent responds with exactly:
+```
+Status: <STATUS> | File: <path>
+```
+or
+```
+Status: <STATUS> | Feature: <name>
+```
+Never with full content in the message body.
+
+## Docs folder
+
+```
+docs/
+  openapi.yaml        # OpenAPI 3.1 — updated by backend-implementer per endpoint
+  architecture.md     # System architecture and directory layout
+  design-patterns.md  # Binding design pattern decisions
+```
+
+All new API endpoints must be documented in `docs/openapi.yaml` by the `backend-implementer` before the feature can be considered done.
+
 ## Key constraints and decisions
 
 - `SpeechRecognition` is Chrome/Edge-only; show a clear unsupported-browser warning on Firefox/Safari.
