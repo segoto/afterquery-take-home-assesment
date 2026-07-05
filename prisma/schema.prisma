@@ -1,0 +1,59 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Job {
+  id           String    @id @default(cuid())
+  slug         String    @unique
+  title        String
+  description  String
+  questionPack Json?
+  sessions     Session[]
+  createdAt    DateTime  @default(now())
+}
+
+model Session {
+  id         String        @id @default(cuid())
+  jobId      String
+  job        Job           @relation(fields: [jobId], references: [id])
+  startedAt  DateTime      @default(now())
+  endedAt    DateTime?
+  status     SessionStatus @default(IN_PROGRESS)
+  turns      Turn[]
+  evaluation Evaluation?
+}
+
+enum SessionStatus {
+  IN_PROGRESS
+  COMPLETED
+  ABANDONED
+}
+
+model Turn {
+  id        String   @id @default(cuid())
+  sessionId String
+  session   Session  @relation(fields: [sessionId], references: [id])
+  speaker   Speaker
+  content   String
+  createdAt DateTime @default(now())
+}
+
+enum Speaker {
+  AI
+  USER
+}
+
+model Evaluation {
+  id        String   @id @default(cuid())
+  sessionId String   @unique
+  session   Session  @relation(fields: [sessionId], references: [id])
+  strengths Json
+  concerns  Json
+  score     Int
+  createdAt DateTime @default(now())
+}
