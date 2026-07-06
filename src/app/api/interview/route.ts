@@ -1,9 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { Prisma } from '@/generated/prisma/client';
 import { prisma } from '@/lib/prisma';
-import { getStaticQuestionBank } from '@/lib/question-bank';
 import { buildBankSelectionPrompt, callModelForBankSelection } from '@/lib/bank-selection';
-import type { PostInterviewResponse, ApiErrorResponse, BankSelectionResponse } from '@/types';
+import { generateAdaptiveFollowUp } from '@/lib/openrouter';
+import type { PostInterviewSuccessResponse, ApiErrorResponse, BankSelectionResponse, BankQuestion } from '@/types';
 
 const CLOSING_STATEMENT =
   "Thank you for your time today. We've covered all the key areas — we'll be in touch with next steps.";
@@ -59,48 +59,16 @@ export async function POST(request: NextRequest): Promise<Response> {
     });
 
     const hasAiTurns = existingTurns.some((t) => t.speaker === 'AI');
-
-    // Load the static question bank for this job
-    const fullBank = getStaticQuestionBank(session.jobId);
-
-    // Collect IDs of bank questions already asked (from AI turn decisionState)
-    const usedQuestionIds = new Set<string>();
-    for (const turn of existingTurns) {
-      if (turn.speaker === 'AI' && turn.decisionState !== null) {
-        const ds = turn.decisionState as Record<string, unknown>;
-        if (typeof ds.selectedQuestionId === 'string' && ds.selectedQuestionId !== '') {
-          usedQuestionIds.add(ds.selectedQuestionId);
-        }
-      }
-    }
-
-    // Filter to questions not yet asked
-    const remainingQuestions = fullBank.filter((q) => !usedQuestionIds.has(q.id));
-
-    // Count AI turns already saved (includes the initial hardcoded question turn)
-    const aiTurnCount = existingTurns.filter((t) => t.speaker === 'AI').length;
-
-    // Build conversation history from existing turns
-    const conversationHistory: Array<{ role: 'user' | 'assistant'; content: string }> =
-      existingTurns.map((turn) => ({
-        role: (turn.speaker === 'AI' ? 'assistant' : 'user') as 'user' | 'assistant',
-        content: turn.content,
-      }));
-
-    // On first call, prepend the initial AI question that was shown to the candidate
-    if (!hasAiTurns) {
-      conversationHistory.unshift({ role: 'assistant', content: currentQuestion });
-    }
-
-    // Always append the candidate's current answer as the last message
-    conversationHistory.push({ role: 'user', content: userAnswer });
+    const openrouterCount = existingTurns.filter(
+      (t) => t.speaker === 'AI' && t.source === 'OPENROUTER'
+    ).length;
 
     // Deduplication guard (retry safety)
     const lastTurn = existingTurns[existingTurns.length - 1];
     const userAnswerAlreadySaved =
       lastTurn?.speaker === 'USER' && lastTurn?.content === userAnswer;
 
-    // Save user answer (pre-model) — skip if already saved on a prior retry
+    // Save user answer before phase routing — runs for all phases
     if (!userAnswerAlreadySaved) {
       if (!hasAiTurns) {
         // First turn: also save the initial AI question before the user answer
@@ -119,20 +87,127 @@ export async function POST(request: NextRequest): Promise<Response> {
           }),
         ]);
       } else {
-        await prisma.$transaction([
-          prisma.turn.create({
-            data: { sessionId, speaker: 'USER', content: userAnswer },
-          }),
-        ]);
+        await prisma.turn.create({
+          data: { sessionId, speaker: 'USER', content: userAnswer },
+        });
       }
     }
+
+    // Re-fetch full transcript after saving the user answer (used by OpenRouter calls)
+    async function fetchFullTranscript() {
+      const allTurns = await prisma.turn.findMany({
+        where: { sessionId },
+        orderBy: { createdAt: 'asc' },
+      });
+      return allTurns.map((t) => ({
+        speaker: t.speaker as string,
+        content: t.content,
+      }));
+    }
+
+    // Phase: complete — both OpenRouter follow-ups already delivered
+    if (openrouterCount >= 2) {
+      await prisma.$transaction([
+        prisma.turn.create({
+          data: {
+            sessionId,
+            speaker: 'AI',
+            content: CLOSING_STATEMENT,
+            source: 'ANTHROPIC',
+            decisionState: Prisma.JsonNull,
+          },
+        }),
+        prisma.session.update({
+          where: { id: sessionId },
+          data: { status: 'COMPLETED', endedAt: new Date() },
+        }),
+      ]);
+      return NextResponse.json<PostInterviewSuccessResponse>({
+        nextQuestion: CLOSING_STATEMENT,
+        isComplete: true,
+        decisionState: null,
+      });
+    }
+
+    // Phase: openrouter-followup-2 — candidate answered follow-up 1, generate follow-up 2
+    if (openrouterCount === 1) {
+      let followUp2: string | null = null;
+      try {
+        const transcript = await fetchFullTranscript();
+        followUp2 = await generateAdaptiveFollowUp(transcript, 2);
+      } catch {
+        followUp2 = null; // graceful degradation on network/API error
+      }
+      if (followUp2 && followUp2.trim()) {
+        await prisma.turn.create({
+          data: { sessionId, speaker: 'AI', content: followUp2.trim(), source: 'OPENROUTER' },
+        });
+        return NextResponse.json<PostInterviewSuccessResponse>({
+          nextQuestion: followUp2.trim(),
+          isComplete: false,
+          decisionState: null,
+        });
+      }
+      // Follow-up 2 unavailable — close interview gracefully
+      await prisma.$transaction([
+        prisma.turn.create({
+          data: {
+            sessionId,
+            speaker: 'AI',
+            content: CLOSING_STATEMENT,
+            source: 'ANTHROPIC',
+            decisionState: Prisma.JsonNull,
+          },
+        }),
+        prisma.session.update({
+          where: { id: sessionId },
+          data: { status: 'COMPLETED', endedAt: new Date() },
+        }),
+      ]);
+      return NextResponse.json<PostInterviewSuccessResponse>({
+        nextQuestion: CLOSING_STATEMENT,
+        isComplete: true,
+        decisionState: null,
+      });
+    }
+
+    // Phase: main-interview (openrouterCount === 0) — bank-based question selection
+    const fullBank = await prisma.question.findMany({
+      where: { jobId: session.jobId },
+      select: { id: true, text: true, type: true },
+      orderBy: { createdAt: 'asc' },
+    }) as BankQuestion[];
+
+    const usedQuestionIds = new Set<string>();
+    for (const turn of existingTurns) {
+      if (turn.speaker === 'AI' && turn.decisionState !== null) {
+        const ds = turn.decisionState as Record<string, unknown>;
+        if (typeof ds.selectedQuestionId === 'string' && ds.selectedQuestionId !== '') {
+          usedQuestionIds.add(ds.selectedQuestionId);
+        }
+      }
+    }
+
+    const remainingQuestions = fullBank.filter((q) => !usedQuestionIds.has(q.id));
+    const aiTurnCount = existingTurns.filter((t) => t.speaker === 'AI').length;
+
+    const conversationHistory: Array<{ role: 'user' | 'assistant'; content: string }> =
+      existingTurns.map((turn) => ({
+        role: (turn.speaker === 'AI' ? 'assistant' : 'user') as 'user' | 'assistant',
+        content: turn.content,
+      }));
+
+    if (!hasAiTurns) {
+      conversationHistory.unshift({ role: 'assistant', content: currentQuestion });
+    }
+    conversationHistory.push({ role: 'user', content: userAnswer });
 
     let nextQuestion: string;
     let isComplete: boolean;
     let decisionStateData: BankSelectionResponse;
 
     if (remainingQuestions.length === 0 && aiTurnCount >= 6) {
-      // Bank fully exhausted and minimum questions met — close without model call
+      // Bank exhausted and minimum turns met — signal complete without a model call
       nextQuestion = CLOSING_STATEMENT;
       isComplete = true;
       decisionStateData = {
@@ -145,7 +220,6 @@ export async function POST(request: NextRequest): Promise<Response> {
         questionRationale: 'Bank fully covered. Interview closed.',
       };
     } else {
-      // Call the model for bank-based selection
       const systemPrompt = buildBankSelectionPrompt(
         session.job.title,
         session.job.description,
@@ -174,23 +248,7 @@ export async function POST(request: NextRequest): Promise<Response> {
       questionRationale: decisionStateData.questionRationale,
     };
 
-    if (isComplete) {
-      await prisma.$transaction([
-        prisma.turn.create({
-          data: {
-            sessionId,
-            speaker: 'AI',
-            content: nextQuestion,
-            source: 'ANTHROPIC',
-            decisionState: storedDecisionState as object,
-          },
-        }),
-        prisma.session.update({
-          where: { id: sessionId },
-          data: { status: 'COMPLETED', endedAt: new Date() },
-        }),
-      ]);
-    } else {
+    if (!isComplete) {
       await prisma.turn.create({
         data: {
           sessionId,
@@ -200,11 +258,51 @@ export async function POST(request: NextRequest): Promise<Response> {
           decisionState: storedDecisionState as object,
         },
       });
+      return NextResponse.json<PostInterviewSuccessResponse>({
+        nextQuestion,
+        isComplete: false,
+        decisionState: storedDecisionState,
+      });
     }
 
-    return NextResponse.json<PostInterviewResponse>({
+    // Bank signals complete — attempt OpenRouter follow-up 1 before closing
+    let followUp1: string | null = null;
+    try {
+      const transcript = await fetchFullTranscript();
+      followUp1 = await generateAdaptiveFollowUp(transcript, 1);
+    } catch {
+      followUp1 = null; // graceful degradation
+    }
+    if (followUp1 && followUp1.trim()) {
+      await prisma.turn.create({
+        data: { sessionId, speaker: 'AI', content: followUp1.trim(), source: 'OPENROUTER' },
+      });
+      return NextResponse.json<PostInterviewSuccessResponse>({
+        nextQuestion: followUp1.trim(),
+        isComplete: false,
+        decisionState: null,
+      });
+    }
+
+    // OpenRouter follow-up 1 unavailable — close interview now
+    await prisma.$transaction([
+      prisma.turn.create({
+        data: {
+          sessionId,
+          speaker: 'AI',
+          content: nextQuestion,
+          source: 'ANTHROPIC',
+          decisionState: storedDecisionState as object,
+        },
+      }),
+      prisma.session.update({
+        where: { id: sessionId },
+        data: { status: 'COMPLETED', endedAt: new Date() },
+      }),
+    ]);
+    return NextResponse.json<PostInterviewSuccessResponse>({
       nextQuestion,
-      isComplete,
+      isComplete: true,
       decisionState: storedDecisionState,
     });
   } catch {

@@ -1,571 +1,456 @@
-# Implementation Plan: Adaptive Question Bank Selection
+# Implementation Plan: Adaptive Question Bank (DB-Driven)
 
 ## Overview
 
-This feature replaces free-form AI question generation in `POST /api/interview` with adaptive selection from role-specific, curated static question banks. The AI model (via `aiClient.complete()`, which routes to OpenRouter when `AI_PROVIDER=openrouter`) receives the conversation history plus the remaining unasked questions and selects the most contextually appropriate next question; the selected question's ID is persisted in `Turn.decisionState` to enforce a no-repeat guarantee across turns.
+This feature replaces the static `src/lib/question-bank.ts` with a database-driven approach by modifying the existing `Question` Prisma model to carry an optional `jobId` foreign key, seeding ≥10 role-appropriate questions per job for all 12 jobs, and updating `POST /api/interview` to fetch the question bank from the DB via `prisma.question.findMany`. It also deletes the now-redundant static file and its test, and revises `BankQuestion`, `bank-selection.ts`, and all affected tests to remove the `skill` field.
 
 ## Prerequisites
 
-- No new Prisma migrations are required. The `decision_state` JSONB column on `turns` (DB: `decision_state`) was already created by migration `20260705230445_add_decision_state_to_turns`.
-- No new environment variables. `AI_PROVIDER`, `ANTHROPIC_API_KEY`, and `OPENROUTER_API_KEY` already exist.
-- The `DecisionPanel` component (`src/components/DecisionPanel.tsx`) was implemented by the `decision-panel` feature and is already rendered by `InterviewRoom.tsx`.
-- `InterviewRoom.tsx` already sends `currentQuestion` in the request body and calls `await res.json()` — the bug fix described in the spec is already in place. The frontend task (T5) must verify this and apply only the type-compatibility check for the updated `DecisionState`.
+1. The migration `20260705230445_add_decision_state_to_turns` is already applied — do NOT create another migration for `decisionState`.
+2. The migration `20260706001056_add_source_to_turns` is already applied.
+3. No new environment variables are required.
+4. The Prisma client must be regenerated (`npx prisma generate`) after the schema change in T1.
+5. The new migration must be applied (`npx prisma migrate dev`) before the seed in T6.
+6. Correct execution order: T1 → generate → T3 (migrate) → T6 (seed). Code changes in T2, T4, T5, T7, T8 are independent of the migration order.
 
 ## Task Graph
 
-| Task | Wave | Type     | Description                                                                 | Depends on |
-|------|------|----------|-----------------------------------------------------------------------------|------------|
-| T1   | 1    | backend  | Create `src/lib/question-bank.ts` with `BankQuestion` type, `QUESTION_BANKS` for all 12 jobs, and `getStaticQuestionBank` | — |
-| T2   | 2    | backend  | Update `src/types/index.ts`: add `selectedQuestionId` to `DecisionState`, add `BankSelectionResponse`, re-export `BankQuestion` | T1 |
-| T3   | 2    | backend  | Create `src/lib/bank-selection.ts`: `buildBankSelectionPrompt` and `callModelForBankSelection` | T1 |
-| T4   | 3    | backend  | Rewrite `src/app/api/interview/route.ts` to use bank-based selection; update `docs/openapi.yaml` | T1, T2, T3 |
-| T5   | 3    | frontend | Verify `src/components/InterviewRoom.tsx` bug fix is in place; ensure `DecisionState` import is type-compatible | T2 |
-| T6   | 4    | backend  | Create `src/__tests__/question-bank.test.ts`                                | T1 |
-| T7   | 4    | backend  | Create `src/__tests__/bank-selection.test.ts`                               | T3 |
-| T8   | 4    | backend  | Update `src/__tests__/interview-route.test.ts` with bank-selection mocks and no-repeat tests | T1, T3, T4 |
+| Task | Wave | Type    | Description                                                                                     | Depends on |
+|------|------|---------|-------------------------------------------------------------------------------------------------|------------|
+| T1   | 1    | backend | Modify `prisma/schema.prisma`: make `skillId` nullable, add `jobId`/`job` to Question, add `questions` to Job | —          |
+| T2   | 1    | backend | Update `src/types/index.ts`: inline `BankQuestion` (id, text, type only), remove re-export     | —          |
+| T3   | 2    | backend | Generate and apply migration `make_skill_nullable_add_job_id_to_questions`                      | T1         |
+| T4   | 2    | backend | Update `src/lib/bank-selection.ts`: change import source to `@/types`, remove `skill` from prompt format | T2         |
+| T5   | 3    | backend | Update `src/app/api/interview/route.ts` to fetch bank from DB; delete `src/lib/question-bank.ts` and `src/__tests__/question-bank.test.ts` | T2, T3, T4 |
+| T6   | 4    | backend | Extend `prisma/seed.ts`: upsert ≥10 bank questions per job for all 12 jobs with `jobId` set    | T3, T5     |
+| T7   | 4    | backend | Update `src/__tests__/bank-selection.test.ts` and `src/__tests__/interview-route.test.ts`       | T2, T4, T5 |
+| T8   | 4    | backend | Update `docs/openapi.yaml`: revise `POST /api/interview` description to reflect DB-sourced bank | T5         |
 
-Wave 1 tasks run fully in parallel. Wave 2 tasks start once Wave 1 is complete. Wave 3 tasks start once Wave 2 is complete. Wave 4 tasks start once Wave 3 is complete.
+Wave 1 tasks are fully parallel. Wave 2 tasks start only when all Wave 1 tasks are complete. Wave 3 tasks start when all Wave 2 tasks are complete. Wave 4 tasks are all parallel and start when Wave 3 is complete.
 
 ## Task Details
 
-### T1: Create `src/lib/question-bank.ts`
-
+### T1: Modify Prisma Schema
 - **Type**: backend
 - **Wave**: 1
 - **Files to create or modify**:
-  - `src/lib/question-bank.ts` — new file: defines `BankQuestion` interface, `QUESTION_BANKS` constant (all 12 jobs), and `getStaticQuestionBank` utility function
+  - `prisma/schema.prisma` — Modify the `Question` model and `Job` model
 - **Implementation notes**:
+  The `Question` model currently has `skillId String @map("skill_id")` and `skill Skill @relation(...)`. Both must become optional:
+  ```prisma
+  model Question {
+    id        String       @id @default(cuid())
+    jobId     String?      @map("job_id")
+    skillId   String?      @map("skill_id")
+    text      String
+    seniority Seniority?
+    type      QuestionType
+    job       Job?         @relation(fields: [jobId], references: [id], onDelete: Cascade)
+    skill     Skill?       @relation(fields: [skillId], references: [id], onDelete: SetNull)
+    createdAt DateTime     @default(now()) @map("created_at")
 
-  Export the `BankQuestion` interface as the canonical definition (types/index.ts will re-export it):
-  ```typescript
-  export interface BankQuestion {
-    id: string;       // e.g. "sqb-swe-001"
-    text: string;
-    type: 'TECHNICAL' | 'BEHAVIORAL' | 'SITUATIONAL';
-    skill: string;    // e.g. "TypeScript and Node.js"
+    @@map("questions")
   }
   ```
-
-  Export `QUESTION_BANKS: Record<string, BankQuestion[]>` keyed by job ID. All 12 job IDs from `src/lib/jobs.ts` must have entries:
-
-  | Job ID | Abbreviation | Example ID |
-  |--------|-------------|------------|
-  | `clswe0001000000000000000001` | `swe` | `sqb-swe-001` |
-  | `clspm0002000000000000000002` | `spm` | `sqb-spm-001` |
-  | `clsda0003000000000000000003` | `sda` | `sqb-sda-001` |
-  | `clbfe0004000000000000000004` | `bfe` | `sqb-bfe-001` |
-  | `clbbe0005000000000000000005` | `bbe` | `sqb-bbe-001` |
-  | `cldvo0006000000000000000006` | `dvo` | `sqb-dvo-001` |
-  | `cldate0007000000000000000007` | `de` | `sqb-de-001` |
-  | `clmle0008000000000000000008` | `mle` | `sqb-mle-001` |
-  | `clqae0009000000000000000009` | `qae` | `sqb-qae-001` |
-  | `clpmt0010000000000000000010` | `pmt` | `sqb-pmt-001` |
-  | `clsre0011000000000000000011` | `sre` | `sqb-sre-001` |
-  | `clsec0012000000000000000012` | `sec` | `sqb-sec-001` |
-
-  Each job must have at least 10 questions with: ≥3 TECHNICAL, ≥3 BEHAVIORAL, ≥2 SITUATIONAL, and the remaining ≥2 may be any type. All IDs across all 12 banks must be globally unique.
-
-  Export the utility function:
-  ```typescript
-  export function getStaticQuestionBank(jobId: string): BankQuestion[] {
-    return QUESTION_BANKS[jobId] ?? [];
-  }
+  The `Job` model must gain a reverse relation field (Prisma requires both sides):
+  ```prisma
+  questions Question[]
   ```
-  This function is pure: no async, no side effects, no external dependencies.
-
-  **Representative bank structure example (Software Engineer — `sqb-swe-*`):**
-  - TECHNICAL: system design, TypeScript/Node.js, API design, debugging, code quality
-  - BEHAVIORAL: collaboration, handling failure, code review, ownership, time management
-  - SITUATIONAL: handling production incidents, technical disagreement with stakeholders, deadlines with tech debt
-
-  Author similar coverage-appropriate banks for all 12 roles based on each job description in `src/lib/jobs.ts`.
-
+  Add this line to the `Job` model alongside `skills Skill[]` and `sessions Session[]`. The `QuestionType` enum is unchanged. After editing, run `npx prisma generate` to verify the schema compiles without errors.
 - **Testing**:
-  - Unit: covered by T6
-  - Integration: N/A (pure constant + function, no I/O)
-  - Manual: import `getStaticQuestionBank('clswe0001000000000000000001')` in a scratch script and verify 10+ entries are returned with correct shape
+  - Unit: N/A (schema change, no logic).
+  - Integration: Run `npx prisma generate` and confirm it exits 0 with no errors. Run `npx tsc --noEmit` and confirm no type errors related to `Question` or `Job`.
+  - Manual: Open Prisma Studio (`npx prisma studio`) after the migration (T3) and confirm the `questions` table shows a nullable `job_id` column.
 
 ---
 
 ### T2: Update `src/types/index.ts`
+- **Type**: backend
+- **Wave**: 1
+- **Files to create or modify**:
+  - `src/types/index.ts` — Remove the re-export of `BankQuestion` from the deleted file; add `BankQuestion` inline
+- **Implementation notes**:
+  Remove line 1 of the current file:
+  ```typescript
+  export type { BankQuestion } from '@/lib/question-bank';
+  ```
+  Replace it with the inline definition placed before the `AuthUser` interface (or at any logical position near the top):
+  ```typescript
+  export interface BankQuestion {
+    id: string;
+    text: string;
+    type: 'TECHNICAL' | 'BEHAVIORAL' | 'SITUATIONAL';
+  }
+  ```
+  The `skill` field is intentionally absent. No other types in `src/types/index.ts` change — `DecisionState`, `BankSelectionResponse`, `ClaudeInterviewResponse`, `PostInterviewSuccessResponse`, and all auth types remain identical.
+- **Testing**:
+  - Unit: N/A (type-only change).
+  - Integration: Run `npx tsc --noEmit` and confirm no errors. The `BankQuestion` type must be importable from `@/types` without error.
+  - Manual: None required.
 
+---
+
+### T3: Generate and Apply Migration
 - **Type**: backend
 - **Wave**: 2
 - **Files to create or modify**:
-  - `src/types/index.ts` — add `selectedQuestionId` to `DecisionState`, add `BankSelectionResponse`, add `BankQuestion` re-export; preserve all existing types
+  - `prisma/migrations/` — A new migration directory is created by the command
 - **Implementation notes**:
+  Run exactly:
+  ```bash
+  npx prisma migrate dev --name make_skill_nullable_add_job_id_to_questions
+  ```
+  The generated SQL must:
+  1. Drop the `NOT NULL` constraint on `skill_id` in the `questions` table.
+  2. Add a nullable `job_id` column (TEXT or VARCHAR) to the `questions` table.
+  3. Add a foreign key constraint from `questions.job_id` to `jobs.id` with `ON DELETE CASCADE`.
+  4. Create an index on `questions(job_id)` for query performance (the route queries `WHERE job_id = ?` on every turn).
 
-  1. Add a re-export of `BankQuestion` from `@/lib/question-bank` (do NOT duplicate the definition):
-     ```typescript
-     export type { BankQuestion } from '@/lib/question-bank';
-     ```
+  If Prisma does not auto-generate the index, add it manually to the migration SQL file before applying:
+  ```sql
+  CREATE INDEX "questions_job_id_idx" ON "questions"("job_id");
+  ```
+  Verify the migration applies cleanly on the dev DB. The existing `skill_id` NOT NULL constraint drop is a PostgreSQL DDL operation; confirm no errors in output.
 
-  2. Update `DecisionState` to add `selectedQuestionId` as the first field:
-     ```typescript
-     export interface DecisionState {
-       selectedQuestionId: string | null;
-       detectedSkills: string[];
-       coveredTopics: string[];
-       remainingGaps: string[];
-       questionRationale: string;
-     }
-     ```
-     This is backward-compatible: the new field is nullable, so existing code that constructs a `DecisionState` without `selectedQuestionId` will get a TypeScript error and must be updated. The only construction site that changes is `src/app/api/interview/route.ts` (handled in T4). The `DecisionPanel.tsx` and `InterviewRoom.tsx` consume but do not construct `DecisionState`, so they are unaffected.
-
-  3. Add the new `BankSelectionResponse` type:
-     ```typescript
-     export interface BankSelectionResponse {
-       selectedQuestionId: string | null;
-       question: string;
-       isComplete: boolean;
-       detectedSkills: string[];
-       coveredTopics: string[];
-       remainingGaps: string[];
-       questionRationale: string;
-     }
-     ```
-
-  4. Keep `ClaudeInterviewResponse` unchanged (backward-compatible with `anthropic.ts` tests).
-  5. Keep `PostInterviewResponse.decisionState: DecisionState` typed as `DecisionState` — the updated type is compatible.
-
+  After the migration, run `npx prisma generate` to refresh the Prisma client with the updated schema.
 - **Testing**:
-  - Unit: `npx tsc --noEmit` must pass with no errors after this task and T1 are both complete
-  - Manual: confirm no TypeScript errors in `src/lib/anthropic.ts` — `callClaudeForNextQuestion` returns `ClaudeInterviewResponse` which embeds the old `DecisionState` shape; since `selectedQuestionId` is new and nullable, the `anthropic.ts` file will produce TypeScript errors because its `decisionState` construction omits `selectedQuestionId`. The implementer must add `selectedQuestionId: null` to the `decisionState` object in `callClaudeForNextQuestion` in `src/lib/anthropic.ts` to satisfy the updated type.
+  - Unit: N/A.
+  - Integration: Confirm `npx prisma migrate dev` exits 0. Confirm `npx prisma generate` exits 0. Connect to the DB (via Prisma Studio or psql) and verify `questions.job_id` exists as a nullable column with a foreign key to `jobs.id`.
+  - Manual: Run `npx prisma studio`, open the `questions` table, confirm both `job_id` and `skill_id` are nullable.
 
 ---
 
-### T3: Create `src/lib/bank-selection.ts`
-
+### T4: Update `src/lib/bank-selection.ts`
 - **Type**: backend
 - **Wave**: 2
 - **Files to create or modify**:
-  - `src/lib/bank-selection.ts` — new file: `buildBankSelectionPrompt` (pure function) and `callModelForBankSelection` (async, server-only)
+  - `src/lib/bank-selection.ts` — Change import source; update prompt format line
 - **Implementation notes**:
-
-  This file must NOT include `'use client'`. It must not be imported from any client component.
-
-  Import `BankQuestion` from `@/lib/question-bank` (not from `@/types`).
-  Import `BankSelectionResponse` from `@/types`.
-  Import `aiClient` from `@/lib/ai-client`.
-
-  **`buildBankSelectionPrompt`:**
+  **Change 1 — import:**
+  Remove:
   ```typescript
-  export function buildBankSelectionPrompt(
-    jobTitle: string,
-    jobDescription: string,
-    remainingQuestions: BankQuestion[],
-    aiTurnCount: number,
-  ): string
+  import type { BankQuestion } from '@/lib/question-bank';
+  ```
+  Replace with:
+  ```typescript
+  import type { BankQuestion } from '@/types';
   ```
 
-  The returned prompt string must contain all of the following sections, in order:
-
-  1. Role establishment: "You are an expert AI interviewer conducting a structured job interview for **{jobTitle}**."
-  2. Job description block verbatim.
-  3. Available questions block:
-     - If `remainingQuestions.length > 0`: list each question as `[id: {id}] ({type} | {skill}) {text}`, one per line inside a labelled section.
-     - If `remainingQuestions.length === 0`: include the text "All bank questions have been covered. Close the interview gracefully."
-  4. Selection rules:
-     - Select the most contextually appropriate question from the available list based on the conversation history.
-     - Optionally rephrase the selected question slightly for natural conversational flow.
-     - Set `selectedQuestionId` to the matching `id` from the list.
-     - Across the full session, at least 2 questions must be selected explicitly because of something the candidate said in a prior answer; for each such selection, `questionRationale` must quote or paraphrase the specific candidate statement that motivated the choice.
-     - Set `isComplete: true` only when: at least 6 total questions have been asked (count assistant turns in the conversation history; `aiTurnCount` is {aiTurnCount} as additional context) AND adequate coverage of key role competencies is achieved, OR when all bank questions have been covered.
-     - When `isComplete: true`, set `selectedQuestionId` to `null` and set `question` to a polite closing statement thanking the candidate.
-  5. Tracking fields instruction: always populate `detectedSkills`, `coveredTopics`, `remainingGaps`, and `questionRationale` in every response.
-  6. JSON-only response instruction: respond ONLY with valid JSON, no prose, no markdown fences, matching this exact shape:
-     ```json
-     {
-       "selectedQuestionId": "string or null",
-       "question": "string",
-       "isComplete": false,
-       "detectedSkills": ["string"],
-       "coveredTopics": ["string"],
-       "remainingGaps": ["string"],
-       "questionRationale": "string"
-     }
-     ```
-
-  **`callModelForBankSelection`:**
+  **Change 2 — prompt format:**
+  In `buildBankSelectionPrompt`, find the line inside the `map` callback:
   ```typescript
-  export async function callModelForBankSelection(
-    systemPrompt: string,
-    conversationHistory: Array<{ role: 'user' | 'assistant'; content: string }>,
-  ): Promise<BankSelectionResponse>
+  `[id: ${q.id}] (${q.type} | ${q.skill}) ${q.text}`
   ```
-
-  Implementation steps (in order):
-  1. Call `const raw = await aiClient.complete({ systemPrompt, messages: conversationHistory })`.
-  2. Strip markdown fences: `const clean = raw.replace(/^```json\n?/, '').replace(/\n?```$/, '').trim()`.
-  3. Parse: `const parsed: unknown = JSON.parse(clean)` — throw on invalid JSON (do not catch here; route handler catches it).
-  4. Cast: `const obj = parsed as Record<string, unknown>`.
-  5. Apply safe defaults:
-     - `selectedQuestionId`: if `typeof obj.selectedQuestionId === 'string' && obj.selectedQuestionId !== ''` → use the value; otherwise `null`.
-     - `question`: `typeof obj.question === 'string' ? obj.question : ''`.
-     - `isComplete`: `typeof obj.isComplete === 'boolean' ? obj.isComplete : false`.
-     - `detectedSkills`, `coveredTopics`, `remainingGaps`: filter the array entries for strings or default to `[]`.
-     - `questionRationale`: `typeof obj.questionRationale === 'string' ? obj.questionRationale : ''`.
-  6. Return the fully-typed `BankSelectionResponse`.
-
+  Replace with:
+  ```typescript
+  `[id: ${q.id}] (${q.type}) ${q.text}`
+  ```
+  This is the only change to the prompt format. All other sections — selection rules, tracking fields instruction, JSON response instruction, safe defaults in `callModelForBankSelection`, fence-stripping — are preserved verbatim.
 - **Testing**:
-  - Unit: covered by T7
-  - Manual: in a Node.js REPL, call `buildBankSelectionPrompt('Software Engineer', 'desc', [], 6)` and confirm it contains the bank-exhausted text and the adaptive follow-up instruction.
+  - Unit: `npx jest src/__tests__/bank-selection.test.ts` — tests use fixtures without `skill`, which are updated in T7. Confirm `npx tsc --noEmit` passes after this change.
+  - Integration: N/A.
+  - Manual: N/A.
 
 ---
 
-### T4: Update `src/app/api/interview/route.ts` and `docs/openapi.yaml`
-
+### T5: Update Interview Route and Delete Static Files
 - **Type**: backend
 - **Wave**: 3
 - **Files to create or modify**:
-  - `src/app/api/interview/route.ts` — replace `callClaudeForNextQuestion`/`buildInterviewSystemPrompt` with bank-based selection logic
-  - `docs/openapi.yaml` — update `POST /api/interview` description and `decisionState` schema to include `selectedQuestionId`
+  - `src/app/api/interview/route.ts` — Replace static bank call with Prisma query; remove import of `@/lib/question-bank`
+- **Files to delete**:
+  - `src/lib/question-bank.ts` — Delete entirely; no file in `src/` may import from it after deletion
+  - `src/__tests__/question-bank.test.ts` — Delete entirely
 - **Implementation notes**:
-
-  **Route changes (preserve all existing validation, 400/404/409, deduplication guard, first-turn AI save, and $transaction patterns):**
-
-  1. Remove the import of `buildInterviewSystemPrompt` and `callClaudeForNextQuestion` from `@/lib/anthropic`. Add imports:
-     ```typescript
-     import { getStaticQuestionBank } from '@/lib/question-bank';
-     import { buildBankSelectionPrompt, callModelForBankSelection } from '@/lib/bank-selection';
-     import type { BankSelectionResponse } from '@/types';
-     ```
-     Remove `ClaudeInterviewResponse` from the type imports if it is no longer used.
-
-  2. Change the session query from `include: { job: { include: { skills: true } } }` to `include: { job: true }`. This is sufficient since `buildBankSelectionPrompt` only needs `job.title` and `job.description`.
-
-  3. After fetching `existingTurns` (and before the deduplication guard), add the following bank computation block:
-     ```typescript
-     // Load the static question bank for this job
-     const fullBank = getStaticQuestionBank(session.jobId);
-
-     // Collect IDs of bank questions already asked (from AI turn decisionState)
-     const usedQuestionIds = new Set<string>();
-     for (const turn of existingTurns) {
-       if (turn.speaker === 'AI' && turn.decisionState !== null) {
-         const ds = turn.decisionState as Record<string, unknown>;
-         if (typeof ds.selectedQuestionId === 'string' && ds.selectedQuestionId !== '') {
-           usedQuestionIds.add(ds.selectedQuestionId);
-         }
-       }
-     }
-
-     // Filter to questions not yet asked
-     const remainingQuestions = fullBank.filter((q) => !usedQuestionIds.has(q.id));
-
-     // Count AI turns already saved (includes the initial hardcoded question turn)
-     const aiTurnCount = existingTurns.filter((t) => t.speaker === 'AI').length;
-     ```
-
-  4. Replace the `buildInterviewSystemPrompt` + `callClaudeForNextQuestion` block with:
-
-     ```typescript
-     let nextQuestion: string;
-     let isComplete: boolean;
-     let decisionStateData: BankSelectionResponse;
-
-     if (remainingQuestions.length === 0 && aiTurnCount >= 6) {
-       // Bank fully exhausted and minimum questions met — close without model call
-       nextQuestion = "Thank you for your time today. We've covered all the key areas — we'll be in touch with next steps.";
-       isComplete = true;
-       decisionStateData = {
-         selectedQuestionId: null,
-         question: nextQuestion,
-         isComplete: true,
-         detectedSkills: [],
-         coveredTopics: [],
-         remainingGaps: [],
-         questionRationale: 'Bank fully covered. Interview closed.',
-       };
-     } else {
-       // Call the model for bank-based selection
-       const systemPrompt = buildBankSelectionPrompt(
-         session.job.title,
-         session.job.description,
-         remainingQuestions,
-         aiTurnCount,
-       );
-       let modelResponse: BankSelectionResponse;
-       try {
-         modelResponse = await callModelForBankSelection(systemPrompt, conversationHistory);
-       } catch {
-         return NextResponse.json<ApiErrorResponse>(
-           { error: 'AI service unavailable. Please try again.' },
-           { status: 500 }
-         );
-       }
-       nextQuestion = modelResponse.question;
-       isComplete = modelResponse.isComplete;
-       decisionStateData = modelResponse;
-     }
-     ```
-
-  5. When saving the AI turn and optionally completing the session, use `decisionStateData` (without the `question` and `isComplete` fields from the model response) as the stored `decisionState`:
-     ```typescript
-     const storedDecisionState = {
-       selectedQuestionId: decisionStateData.selectedQuestionId,
-       detectedSkills: decisionStateData.detectedSkills,
-       coveredTopics: decisionStateData.coveredTopics,
-       remainingGaps: decisionStateData.remainingGaps,
-       questionRationale: decisionStateData.questionRationale,
-     };
-     ```
-     Use `storedDecisionState as object` when passing to Prisma turn create `decisionState` field.
-
-  6. Return the success response using `nextQuestion`, `isComplete`, and `storedDecisionState`:
-     ```typescript
-     return NextResponse.json<PostInterviewResponse>({
-       nextQuestion,
-       isComplete,
-       decisionState: storedDecisionState,
-     });
-     ```
-
-  **`docs/openapi.yaml` changes for `POST /api/interview`:**
-
-  - Update the description to mention bank-based question selection via `callModelForBankSelection`, replacing the Claude-direct reference.
-  - Add `selectedQuestionId` to the `decisionState` schema object under `required` and `properties`:
-    ```yaml
-    selectedQuestionId:
-      oneOf:
-        - type: string
-          example: "sqb-swe-004"
-        - type: 'null'
-    ```
-  - Update the `inProgress` and `complete` response examples to include `selectedQuestionId`.
-  - Update the `aiUnavailable` 500 description to mention `callModelForBankSelection`.
-
-- **Testing**:
-  - Unit: covered by T8
-  - Integration: start `npm run dev`, open an interview session for any job, submit an answer, and confirm the response contains `decisionState.selectedQuestionId` as a non-null string (e.g. `"sqb-swe-003"`).
-  - Manual: in Prisma Studio, open a `Turn` row where `speaker = AI` and confirm `decision_state` JSON contains `selectedQuestionId`.
-
----
-
-### T5: Verify `src/components/InterviewRoom.tsx` is compatible with updated `DecisionState`
-
-- **Type**: frontend
-- **Wave**: 3
-- **Files to create or modify**:
-  - `src/components/InterviewRoom.tsx` — verify the bug fix is in place; add `selectedQuestionId: null` only if TypeScript requires it anywhere in the file
-  - `src/components/DecisionPanel.tsx` — no changes required; it renders only the 4 existing fields and will ignore `selectedQuestionId`
-- **Implementation notes**:
-
-  **Verification checklist (confirm all are already true; if any is missing, apply the fix):**
-
-  1. The `submitTurn` fetch body uses `currentQuestion: state.currentQuestion` (not `turnNumber`). Looking at the current code in `src/components/InterviewRoom.tsx` line 189–193, this is already correct.
-  2. After `res.ok`, the component calls `const data = (await res.json()) as PostInterviewResponse`. Looking at lines 213–214, this is already correct.
-  3. `TURN_SAVED` is dispatched with `decisionState: data.decisionState ?? null`. Looking at lines 215–220, this is already correct.
-  4. There is no `ReadableStream` / `getReader()` code anywhere in the file. This is already the case.
-
-  **Type-compatibility check:**
-
-  `DecisionState` now has `selectedQuestionId: string | null` as the first field. The `InterviewRoomState.decisionState` is typed as `DecisionState | null`. The `InterviewRoom` component never constructs a `DecisionState` object directly — it only passes `data.decisionState` (from the API response) and `action.decisionState` (in reducer cases) to the state. Since the updated `DecisionState` type is structurally backward-compatible for consumers, no changes to the component logic are needed.
-
-  Run `npx tsc --noEmit` after T2 is complete to confirm zero errors in this file.
-
-- **Testing**:
-  - Unit: no new component tests required; existing `InterviewRoom.test.tsx` must still pass
-  - Manual: start the app, navigate to an interview, submit a voice answer, and confirm the `DecisionPanel` renders without errors and displays `detectedSkills`, `coveredTopics`, `remainingGaps`, and `questionRationale` correctly
-
----
-
-### T6: Create `src/__tests__/question-bank.test.ts`
-
-- **Type**: backend
-- **Wave**: 4
-- **Files to create or modify**:
-  - `src/__tests__/question-bank.test.ts` — new test file
-- **Implementation notes**:
-
-  Import `getStaticQuestionBank` and `QUESTION_BANKS` from `@/lib/question-bank`.
-
-  The 12 job IDs to use in parameterized tests:
-  ```
-  clswe0001000000000000000001, clspm0002000000000000000002, clsda0003000000000000000003,
-  clbfe0004000000000000000004, clbbe0005000000000000000005, cldvo0006000000000000000006,
-  cldate0007000000000000000007, clmle0008000000000000000008, clqae0009000000000000000009,
-  clpmt0010000000000000000010, clsre0011000000000000000011, clsec0012000000000000000012
-  ```
-
-  Required test cases:
-  1. `getStaticQuestionBank` returns the correct bank array for a known job ID (spot-check `clswe0001000000000000000001` — verify it is an array with length ≥ 10 and first element has all 4 required fields).
-  2. `getStaticQuestionBank('nonexistent')` returns `[]`.
-  3. Parameterized over all 12 job IDs: each returns a bank with at least 10 entries.
-  4. Parameterized over all 12 job IDs: each bank contains at least 1 TECHNICAL, 1 BEHAVIORAL, and 1 SITUATIONAL question.
-  5. Parameterized over all 12 job IDs: each bank contains at least 3 TECHNICAL questions.
-  6. Parameterized over all 12 job IDs: each bank contains at least 3 BEHAVIORAL questions.
-  7. Parameterized over all 12 job IDs: each bank contains at least 2 SITUATIONAL questions.
-  8. Global uniqueness: collect all question IDs from all 12 banks into a flat array; confirm no duplicates (compare `Set.size` to array length).
-  9. Shape validation: for every question in every bank, assert `id` is a non-empty string, `text` is a non-empty string, `type` is one of `TECHNICAL | BEHAVIORAL | SITUATIONAL`, and `skill` is a non-empty string.
-  10. ID pattern: for every question in every bank, assert `id` matches `/^sqb-[a-z]{2,6}-\d{3}$/`.
-
-- **Testing**:
-  - Run: `npx jest src/__tests__/question-bank.test.ts`
-  - All tests must pass with zero failures.
-
----
-
-### T7: Create `src/__tests__/bank-selection.test.ts`
-
-- **Type**: backend
-- **Wave**: 4
-- **Files to create or modify**:
-  - `src/__tests__/bank-selection.test.ts` — new test file
-- **Implementation notes**:
-
-  Use `jest.unstable_mockModule` to mock `@/lib/ai-client` (ESM-compatible, consistent with the existing pattern in `interview-route.test.ts` and `ai-client.test.ts`). Dynamically import `buildBankSelectionPrompt` and `callModelForBankSelection` from `@/lib/bank-selection` after the mock is registered.
-
-  Fixture data:
+  **Step 1 — Remove import:**
+  Remove line:
   ```typescript
-  const mockAiClientComplete = jest.fn<() => Promise<string>>();
+  import { getStaticQuestionBank } from '@/lib/question-bank';
+  ```
+
+  **Step 2 — Replace bank fetch:**
+  Find the line in the route (currently line 176):
+  ```typescript
+  const fullBank = getStaticQuestionBank(session.jobId);
+  ```
+  Replace with:
+  ```typescript
+  const fullBank = await prisma.question.findMany({
+    where: { jobId: session.jobId },
+    select: { id: true, text: true, type: true },
+    orderBy: { createdAt: 'asc' },
+  }) as BankQuestion[];
+  ```
+  The `as BankQuestion[]` cast is acceptable because `prisma.question.findMany` returns `QuestionType` (the Prisma enum) for `type`, while `BankQuestion.type` is `'TECHNICAL' | 'BEHAVIORAL' | 'SITUATIONAL'`. The string values are identical at runtime.
+
+  **Step 3 — Ensure BankQuestion is imported:**
+  Verify `BankQuestion` is imported from `@/types` in the route's import line. The current import line reads:
+  ```typescript
+  import type { PostInterviewSuccessResponse, ApiErrorResponse, BankSelectionResponse } from '@/types';
+  ```
+  Add `BankQuestion` to that import:
+  ```typescript
+  import type { PostInterviewSuccessResponse, ApiErrorResponse, BankSelectionResponse, BankQuestion } from '@/types';
+  ```
+
+  **Step 4 — Delete files:**
+  Delete `src/lib/question-bank.ts` and `src/__tests__/question-bank.test.ts`. After deletion, run:
+  ```bash
+  grep -r "question-bank" /Users/segoto/PersonalProjects/afterquery-take-home-assesment/src/
+  ```
+  Confirm zero results.
+
+  All other route logic is preserved unchanged: session validation (400/404/409), deduplication guard, user/AI turn saving, `usedQuestionIds` computation from `decisionState.selectedQuestionId`, `remainingQuestions` filtering, `aiTurnCount` computation, bank-exhausted path, `callModelForBankSelection` call, OpenRouter follow-up phases, session completion.
+- **Testing**:
+  - Unit: Run `npx tsc --noEmit` and confirm no errors after the deletions and route edit.
+  - Integration: After T7 completes, run `npm test` and confirm all test suites pass.
+  - Manual: Start the dev server (`npm run dev`). Navigate to `/interview/<any-job-slug>` for a job that has been seeded (after T6). Complete a two-question exchange. Confirm the response JSON contains `nextQuestion`, `isComplete: false`, and `decisionState.selectedQuestionId` matching the `qb-<abbrev>-NNN` pattern.
+
+---
+
+### T6: Extend `prisma/seed.ts` with Bank Questions
+- **Type**: backend
+- **Wave**: 4
+- **Files to create or modify**:
+  - `prisma/seed.ts` — Add ≥10 bank questions per job for all 12 jobs; keep existing skill-based seeds untouched
+- **Implementation notes**:
+  Append a new section to `prisma/seed.ts` after the existing `console.log('Seeded Data Analyst skills and questions.')` line and before `console.log('Seed complete.')`.
+
+  **Pattern per job:**
+  ```typescript
+  const sweJob2 = await prisma.job.findUniqueOrThrow({ where: { slug: 'software-engineer' } });
+  await prisma.question.upsert({
+    where: { id: 'qb-swe-001' },
+    update: {},
+    create: {
+      id: 'qb-swe-001',
+      jobId: sweJob2.id,
+      skillId: null,
+      text: 'Walk me through how you design a type-safe REST API in TypeScript, including error handling and input validation.',
+      type: 'TECHNICAL',
+      seniority: null,
+    },
+  });
+  // ... 9+ more questions for Software Engineer
+  console.log('Seeded 12 bank questions for Software Engineer.');
+  ```
+  Note: The variable names for `findUniqueOrThrow` results in the bank section must be distinct from those in the existing seed (e.g., use `sweJob2` or rename using a `const bankJobs = await Promise.all([...])` block to avoid variable shadowing within the `main` function scope).
+
+  **ID scheme** (must be used exactly as specified in the feature spec):
+  - Software Engineer → `qb-swe-001` to `qb-swe-012`
+  - Product Manager → `qb-pm-001` to `qb-pm-012`
+  - Data Analyst → `qb-da-001` to `qb-da-012`
+  - Frontend Engineer → `qb-fe-001` to `qb-fe-012`
+  - Backend Engineer → `qb-be-001` to `qb-be-012`
+  - DevOps Engineer → `qb-dvo-001` to `qb-dvo-012`
+  - Data Engineer → `qb-de-001` to `qb-de-012`
+  - ML Engineer → `qb-mle-001` to `qb-mle-012`
+  - QA Engineer → `qb-qa-001` to `qb-qa-012`
+  - Product Manager – Technical → `qb-pmt-001` to `qb-pmt-012`
+  - Site Reliability Engineer → `qb-sre-001` to `qb-sre-012`
+  - Security Engineer → `qb-sec-001` to `qb-sec-012`
+
+  **Per-job minimum type composition** (12 questions per job recommended, 10 minimum):
+  - ≥3 questions of type `TECHNICAL`
+  - ≥3 questions of type `BEHAVIORAL`
+  - ≥2 questions of type `SITUATIONAL`
+  - Remaining 2+ may be any type
+
+  **Question content source**: The file being deleted (`src/lib/question-bank.ts`) contains 12 well-crafted questions for each of the 12 jobs. Copy the text verbatim from there — only the IDs change (e.g., `sqb-swe-001` → `qb-swe-001`, `sqb-spm-001` → `qb-pm-001`). The `skill` field from the static bank is dropped; `skillId: null` is used for all bank questions. This guarantees high-quality, role-appropriate question text without inventing new content.
+
+  **Job slug to abbreviation mapping** (for `findUniqueOrThrow` calls):
+  - `software-engineer` → questions use `swe`
+  - `product-manager` → questions use `pm`
+  - `data-analyst` → questions use `da`
+  - `frontend-engineer` → questions use `fe`
+  - `backend-engineer` → questions use `be`
+  - `devops-engineer` → questions use `dvo`
+  - `data-engineer` → questions use `de`
+  - `ml-engineer` → questions use `mle`
+  - `qa-engineer` → questions use `qa`
+  - `product-manager-technical` → questions use `pmt`
+  - `site-reliability-engineer` → questions use `sre`
+  - `security-engineer` → questions use `sec`
+
+  Use `prisma.job.findUniqueOrThrow` (not `findUnique`) so a missing job causes a hard failure. Group all 12 job lookups in a single `Promise.all` block to minimize sequential DB round-trips.
+
+  The existing skill-based question seeds (IDs like `qswe-sys-001`, `qspm-str-001`, `qsda-sql-001`) must not be modified or removed. They serve different purposes and may be referenced by existing sessions.
+
+  Idempotency: All new questions are upserted via `prisma.question.upsert({ where: { id: '...' }, update: {}, create: { ... } })`. Running the seed twice produces no duplicate rows.
+- **Testing**:
+  - Unit: N/A (seed script, not unit-testable).
+  - Integration: Run `npx prisma db seed` and confirm it exits 0 with the per-job log messages. Run it again and confirm still exits 0 (idempotency). Query the DB: `SELECT COUNT(*) FROM questions WHERE job_id IS NOT NULL` should return ≥120.
+  - Manual: Start the dev server. Navigate to any job's interview room and complete ≥3 turns. Confirm `decisionState.selectedQuestionId` values match the `qb-<abbrev>-NNN` pattern in the network responses.
+
+---
+
+### T7: Update Test Files
+- **Type**: backend
+- **Wave**: 4
+- **Files to create or modify**:
+  - `src/__tests__/bank-selection.test.ts` — Remove `skill` field from `BankQuestion` fixtures
+  - `src/__tests__/interview-route.test.ts` — Replace static bank mock with `prisma.question.findMany` mock; remove all references to `@/lib/question-bank`
+- **Implementation notes**:
+
+  **`src/__tests__/bank-selection.test.ts` changes:**
+
+  In the `sampleBank` fixture (lines 33–46), remove the `skill` field from both entries:
+  ```typescript
   const sampleBank: BankQuestion[] = [
-    { id: 'sqb-swe-001', text: 'Describe your TypeScript experience.', type: 'TECHNICAL', skill: 'TypeScript' },
-    { id: 'sqb-swe-002', text: 'Tell me about a time you handled a production incident.', type: 'BEHAVIORAL', skill: 'Incident Response' },
+    { id: 'sqb-swe-001', text: 'Describe your TypeScript experience.', type: 'TECHNICAL' },
+    { id: 'sqb-swe-002', text: 'Tell me about a time you handled a production incident.', type: 'BEHAVIORAL' },
   ];
-  const validModelResponse = {
-    selectedQuestionId: 'sqb-swe-001',
-    question: 'Can you describe your TypeScript experience in detail?',
-    isComplete: false,
-    detectedSkills: ['TypeScript'],
-    coveredTopics: [],
-    remainingGaps: ['System Design'],
-    questionRationale: 'Starting with the candidate\'s core skill area.',
-  };
   ```
+  No other changes are needed. All 10 existing test assertions remain valid: Test 2 checks `question.id` and `question.text` (not `skill`), so it passes unchanged. All other tests do not reference the `skill` field.
 
-  Required test cases for `buildBankSelectionPrompt`:
-  1. Output contains `jobTitle` string.
-  2. Output contains each question's `id` and `text` when `remainingQuestions` is non-empty.
-  3. Output contains the adaptive follow-up instruction: assert the output contains the phrase "at least 2" and "candidate" (case-insensitive) and "questionRationale" — confirming the prompt instructs the model to cite prior candidate statements.
-  4. When `remainingQuestions` is empty, output contains the bank-exhausted instruction (assert for "All bank questions have been covered").
-  5. Does not throw when called with empty `remainingQuestions`.
+  **`src/__tests__/interview-route.test.ts` changes:**
 
-  Required test cases for `callModelForBankSelection`:
-  6. Parses a valid JSON string returned by `aiClient.complete` into a fully-typed `BankSelectionResponse`.
-  7. Strips markdown fences: mock `aiClient.complete` to return `` ```json\n{...}\n``` `` — confirm it still parses correctly.
-  8. Applies safe defaults: mock `aiClient.complete` to return a JSON string missing `detectedSkills` — confirm the returned object has `detectedSkills: []`.
-  9. Applies safe default for `selectedQuestionId`: mock returning JSON with `selectedQuestionId: ""` — confirm it defaults to `null`.
-  10. Throws when the response is not parseable JSON (e.g. `"not json"`) — `expect(...).rejects.toThrow()`.
-
-- **Testing**:
-  - Run: `npx jest src/__tests__/bank-selection.test.ts`
-  - All tests must pass with zero failures.
-
----
-
-### T8: Update `src/__tests__/interview-route.test.ts`
-
-- **Type**: backend
-- **Wave**: 4
-- **Files to create or modify**:
-  - `src/__tests__/interview-route.test.ts` — replace `@/lib/anthropic` mock with `@/lib/bank-selection` and `@/lib/question-bank` mocks; add no-repeat and bank-exhausted tests
-- **Implementation notes**:
-
-  **Mock registration changes:**
-
-  1. Remove (or keep for backward-compat) the `@/lib/anthropic` mock. The route no longer calls `callClaudeForNextQuestion` or `buildInterviewSystemPrompt`, so the mock can be replaced or simplified to an empty module. Keep `buildEvaluationPrompt` if `evaluate/route.ts` tests depend on it being in the same file — but since this test file only tests the interview route, the anthropic mock can be removed entirely or kept as a stub.
-
-  2. Add a mock for `@/lib/bank-selection`:
+  1. **Remove** the `mockGetStaticQuestionBank` mock function declaration (line 53):
      ```typescript
-     const mockCallModelForBankSelection = jest.fn<() => Promise<BankSelectionResponse>>();
-     const mockBuildBankSelectionPrompt = jest.fn<() => string>().mockReturnValue('mock-bank-system-prompt');
-
-     jest.unstable_mockModule('@/lib/bank-selection', () => ({
-       callModelForBankSelection: mockCallModelForBankSelection,
-       buildBankSelectionPrompt: mockBuildBankSelectionPrompt,
-     }));
+     // DELETE this line:
+     const mockGetStaticQuestionBank = jest.fn<() => BankQuestion[]>();
      ```
 
-  3. Add a mock for `@/lib/question-bank`:
+  2. **Add** a new mock function for `prisma.question.findMany` (insert near the other mock function declarations):
      ```typescript
-     const mockGetStaticQuestionBank = jest.fn<() => BankQuestion[]>();
+     const mockQuestionFindMany = jest.fn<
+       (args: unknown) => Promise<Array<{ id: string; text: string; type: string }>>
+     >();
+     ```
 
+  3. **Remove** the entire `jest.unstable_mockModule('@/lib/question-bank', ...)` block (lines 77–80):
+     ```typescript
+     // DELETE entire block:
      jest.unstable_mockModule('@/lib/question-bank', () => ({
        getStaticQuestionBank: mockGetStaticQuestionBank,
        QUESTION_BANKS: {},
      }));
      ```
 
-  4. Update `beforeEach` to set default return values:
+  4. **Update** the prisma mock object to include `question: { findMany: mockQuestionFindMany }`:
      ```typescript
-     mockGetStaticQuestionBank.mockReturnValue([
-       { id: 'sqb-swe-001', text: 'Q1', type: 'TECHNICAL', skill: 'TypeScript' },
-       { id: 'sqb-swe-002', text: 'Q2', type: 'BEHAVIORAL', skill: 'Teamwork' },
-     ]);
-     mockCallModelForBankSelection.mockResolvedValue({
-       selectedQuestionId: 'sqb-swe-001',
-       question: 'Next AI question',
-       isComplete: false,
-       detectedSkills: ['TypeScript'],
-       coveredTopics: ['Background'],
-       remainingGaps: ['System Design'],
-       questionRationale: 'Probing system design next.',
-     });
+     jest.unstable_mockModule('@/lib/prisma', () => ({
+       prisma: {
+         session: { findUnique: mockSessionFindUnique, update: mockSessionUpdate },
+         turn: { create: mockTurnCreate, findMany: mockTurnFindMany },
+         question: { findMany: mockQuestionFindMany },
+         $transaction: mockTransaction,
+       },
+     }));
      ```
 
-  5. Update `validSession` to remove the `skills` field from `job` (since the session query no longer fetches `skills`):
+  5. **Update** the `defaultBank` fixture (lines 138–141) to remove `skill`:
      ```typescript
-     const validJob = { id: 'job_id_123', title: 'Software Engineer', description: 'Test description' };
+     const defaultBank: BankQuestion[] = [
+       { id: 'qb-swe-001', text: 'Q1', type: 'TECHNICAL' },
+       { id: 'qb-swe-002', text: 'Q2', type: 'BEHAVIORAL' },
+     ];
      ```
-     Update `mockSessionFindUnique` to return the simplified `validJob` shape.
 
-  **New test cases to add:**
+  6. **Update** `beforeEach` (line 153): Replace:
+     ```typescript
+     mockGetStaticQuestionBank.mockReturnValue(defaultBank);
+     ```
+     with:
+     ```typescript
+     mockQuestionFindMany.mockResolvedValue(defaultBank);
+     ```
 
-  - "saves AI turn with `decisionState.selectedQuestionId` matching mock return value": after POST succeeds, inspect the `$transaction` call that saves the AI turn; verify the `decisionState` argument contains `selectedQuestionId: 'sqb-swe-001'`.
+  7. **Update** the bank-exhausted path tests: In both bank-exhausted test cases (lines ~370 and ~391), replace:
+     ```typescript
+     mockGetStaticQuestionBank.mockReturnValue([]);
+     ```
+     with:
+     ```typescript
+     mockQuestionFindMany.mockResolvedValue([]);
+     ```
+     All other assertions in those tests remain unchanged.
 
-  - "no-repeat guarantee: when an existing AI turn has `decisionState.selectedQuestionId`, the bank passed to `callModelForBankSelection` excludes that ID":
-    - Mock `mockTurnFindMany` to return an AI turn with `decisionState: { selectedQuestionId: 'sqb-swe-001', ... }`.
-    - After POST, capture the `remainingQuestions` argument passed to `callModelForBankSelection` by inspecting `mockBuildBankSelectionPrompt` calls or by checking `mockCallModelForBankSelection`'s call arguments indirectly through the system prompt content.
-    - Assert `sqb-swe-001` does not appear in the bank provided to the model.
+  8. The no-repeat guarantee test requires no assertion changes — `buildBankSelectionPrompt.mock.calls[0][2]` still receives `remainingQuestions` as the third argument. The fixture IDs in `defaultBank` (`qb-swe-001`, `qb-swe-002`) are already updated in step 5. The test assertion that the already-used question ID is excluded from `remainingQuestions` continues to pass.
 
-  - "bank exhausted with aiTurnCount >= 6: returns isComplete true and does NOT call model":
-    - Mock `mockGetStaticQuestionBank` to return `[]` (empty bank).
-    - Mock `mockTurnFindMany` to return 6 AI turns (so `aiTurnCount === 6`).
-    - POST the request; assert `res.status === 200`, `body.isComplete === true`, and `mockCallModelForBankSelection` was NOT called.
+  9. Confirm the file's top-level imports do NOT reference `@/lib/question-bank`. The `BankQuestion` type is imported from `@/types` (line 12 already does this). Run `grep "question-bank" src/__tests__/interview-route.test.ts` and confirm zero results after changes.
 
-  - "bank exhausted with aiTurnCount >= 6: decisionState equals the static closing state":
-    - Same setup as above; assert `body.decisionState` deep-equals `{ selectedQuestionId: null, detectedSkills: [], coveredTopics: [], remainingGaps: [], questionRationale: 'Bank fully covered. Interview closed.' }`.
-
-  - "returns 500 when callModelForBankSelection throws":
-    - `mockCallModelForBankSelection.mockRejectedValue(new Error('model error'))`.
-    - Assert `res.status === 500` and `body.error === 'AI service unavailable. Please try again.'`.
-
-  **Existing tests that must continue to pass:**
-  - All 400/404/409 validation tests — unchanged logic.
-  - Turn history fetch test — unchanged.
-  - Transaction call count tests — update to account for bank-selection mock instead of Claude mock.
-  - Unexpected error tests (DB errors) — unchanged catch-all behavior.
-
-  **Update the `mockClaudeResponse` fixture to `BankSelectionResponse` shape** for the `success` describe block test that checks the full response body.
-
+  All existing test assertions — 400/404/409/500 responses, deduplication guard, turn saving, `selectedQuestionId` in stored `decisionState`, bank-exhausted static closing statement, `isComplete: true` when model signals completion — must pass without modifying any assertion.
 - **Testing**:
-  - Run: `npx jest src/__tests__/interview-route.test.ts`
-  - All tests must pass with zero failures.
-  - Run: `npm test` to confirm no regressions in other test files.
+  - Unit: `npx jest src/__tests__/bank-selection.test.ts` — all 10 tests must pass. `npx jest src/__tests__/interview-route.test.ts` — all tests must pass.
+  - Integration: `npm test` — no failing test suites across the entire project.
+  - Manual: N/A (test-only changes).
 
 ---
 
-## Data migrations
+### T8: Update `docs/openapi.yaml`
+- **Type**: backend
+- **Wave**: 4
+- **Files to create or modify**:
+  - `docs/openapi.yaml` — Update `POST /api/interview` description to reflect DB-sourced question bank
+- **Implementation notes**:
+  The existing `POST /api/interview` entry already documents `selectedQuestionId` (confirmed at line 608 of the current file) and the `decisionState` response schema is correct and unchanged. Only the prose description needs updating.
 
-No Prisma schema changes are required. The `decision_state JSONB?` column on `turns` (already created by migration `20260705230445_add_decision_state_to_turns`) continues to be used. Its logical JSON structure gains the `selectedQuestionId` key, which is handled in application code only.
+  Locate the `description` field of the `POST /api/interview` path item and update any references to:
+  - "static question bank" → "database question bank (fetched via `prisma.question.findMany({ where: { jobId } })`)"
+  - Any mention of `getStaticQuestionBank` → remove or replace with the Prisma query description
 
-## API documentation updates
+  The updated description should state:
+  - On each turn, bank questions are fetched from the `questions` table filtered by `job_id = session.jobId`.
+  - The `selectedQuestionId` in `decisionState` references a `questions` table row (e.g., `qb-swe-001`).
+  - All other behaviour — no-repeat guarantee via `decisionState.selectedQuestionId`, bank-exhausted path, OpenRouter follow-up phases, decisionState shape — is unchanged.
 
-`POST /api/interview` in `docs/openapi.yaml` must be updated by the T4 implementer:
+  No changes to response schema definitions or error response schemas are needed.
+- **Testing**:
+  - Unit: N/A.
+  - Integration: Validate YAML syntax after edits. Run `node -e "require('js-yaml').load(require('fs').readFileSync('docs/openapi.yaml','utf8'))"` from the project root and confirm no parse error.
+  - Manual: N/A.
 
-1. Update the endpoint `description` to say "uses adaptive bank-based question selection via `callModelForBankSelection` (routes to OpenRouter when `AI_PROVIDER=openrouter`)" replacing the Claude-direct description.
-2. Add `selectedQuestionId` to the `decisionState` schema under `required` and `properties` with `oneOf: [string, null]`.
-3. Update both `inProgress` and `complete` examples in the `200` response to include `selectedQuestionId` (non-null for in-progress, null for complete).
-4. Update the `500` `aiUnavailable` example description to reference `callModelForBankSelection`.
+---
 
-## Cross-cutting concerns
+## Data Migrations
 
-- `BankQuestion` has a single canonical definition in `src/lib/question-bank.ts`. `src/types/index.ts` re-exports it. All other files import from either path — never define it independently.
-- `callModelForBankSelection` and `buildBankSelectionPrompt` are server-only. They must not appear in any `'use client'` file or be re-exported through a client-facing barrel.
-- The `DecisionState` type change (adding `selectedQuestionId: string | null`) affects every file that constructs a `DecisionState` literal. The only construction sites are:
-  - `src/lib/anthropic.ts` → `callClaudeForNextQuestion`: add `selectedQuestionId: null` to the returned `decisionState` to satisfy the updated type. This keeps `anthropic.ts` tests passing.
-  - `src/app/api/interview/route.ts` → handled in T4 (bank-selection response already includes `selectedQuestionId`).
-  - Test fixtures in `src/__tests__/interview-route.test.ts` → handled in T8.
-  - Test fixtures in `src/__tests__/anthropic-prompts.test.ts` → if `DecisionState` objects are constructed there, add `selectedQuestionId: null`; run the test suite to confirm.
-- The T4 implementer must update `src/lib/anthropic.ts` inline (without a separate task) to add `selectedQuestionId: null` to the `decisionState` construction in `callClaudeForNextQuestion`, ensuring `npx tsc --noEmit` continues to pass.
+The following schema changes require a new migration (the `decisionState` migration is already applied and must NOT be repeated):
+
+**Modified `prisma/schema.prisma` — `Question` model:**
+```prisma
+model Question {
+  id        String       @id @default(cuid())
+  jobId     String?      @map("job_id")
+  skillId   String?      @map("skill_id")
+  text      String
+  seniority Seniority?
+  type      QuestionType
+  job       Job?         @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  skill     Skill?       @relation(fields: [skillId], references: [id], onDelete: SetNull)
+  createdAt DateTime     @default(now()) @map("created_at")
+
+  @@map("questions")
+}
+```
+
+**Modified `prisma/schema.prisma` — `Job` model addition:**
+```prisma
+questions Question[]
+```
+
+**Migration command:**
+```bash
+npx prisma migrate dev --name make_skill_nullable_add_job_id_to_questions
+```
+
+**Expected generated SQL (implementer must verify and add index if missing):**
+```sql
+ALTER TABLE "questions" ALTER COLUMN "skill_id" DROP NOT NULL;
+ALTER TABLE "questions" ADD COLUMN "job_id" TEXT;
+ALTER TABLE "questions" ADD CONSTRAINT "questions_job_id_fkey"
+  FOREIGN KEY ("job_id") REFERENCES "jobs"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+CREATE INDEX "questions_job_id_idx" ON "questions"("job_id");
+```
+
+## API Documentation Updates
+
+`POST /api/interview` in `docs/openapi.yaml` — The response schema is unchanged (the `selectedQuestionId` field and `decisionState` object shape are identical to the prior implementation). Only the prose description requires an update to reflect that `fullBank` is now fetched from `prisma.question.findMany({ where: { jobId: session.jobId } })` instead of `getStaticQuestionBank(session.jobId)`. No new endpoints are added or removed.
+
+## Cross-cutting Concerns
+
+- **`BankQuestion` type** (inlined in `src/types/index.ts` after T2): Used by `src/lib/bank-selection.ts` (T4), `src/app/api/interview/route.ts` (T5), `src/__tests__/bank-selection.test.ts` (T7), and `src/__tests__/interview-route.test.ts` (T7). T2 must complete before T4, T5, and T7 begin.
+- **Migration prerequisite for seed**: T3 (migration applied) must complete before T6 (seed) runs, because the seed writes rows with `jobId` set, which requires the `job_id` column to exist in the `questions` table.
+- **File deletion ordering**: `src/lib/question-bank.ts` must not be deleted until both `src/types/index.ts` (T2) and `src/app/api/interview/route.ts` (T5) have been updated to no longer import from it. The deletion is the final step within T5.
+- **No frontend changes**: This feature has no UI component changes. All 8 tasks are backend-only. No changes to `src/components/ui/` are required.
+- **`npx tsc --noEmit` checkpoint**: Run after T1+T2 complete, after T4 completes, after T5 completes, and after T7 completes. Each checkpoint must produce zero errors before proceeding to the next wave.

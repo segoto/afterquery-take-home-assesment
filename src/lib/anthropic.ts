@@ -156,6 +156,7 @@ export async function callClaudeForNextQuestion(
       : ({} as Record<string, unknown>);
 
   const decisionState: DecisionState = {
+    selectedQuestionId: null,
     detectedSkills: Array.isArray(rawDs.detectedSkills)
       ? (rawDs.detectedSkills as unknown[]).filter(
           (s): s is string => typeof s === 'string'

@@ -1,4 +1,8 @@
-export type { BankQuestion } from '@/lib/question-bank';
+export interface BankQuestion {
+  id: string;
+  text: string;
+  type: 'TECHNICAL' | 'BEHAVIORAL' | 'SITUATIONAL';
+}
 
 // The minimal user shape returned to clients
 export interface AuthUser {

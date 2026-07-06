@@ -545,10 +545,11 @@ paths:
         selection via `callModelForBankSelection` (routes to OpenRouter when
         `AI_PROVIDER=openrouter`) to determine the next interview question.
 
-        The route loads the static question bank for the session's job via
-        `getStaticQuestionBank`, computes which questions have already been asked by
-        inspecting `Turn.decisionState.selectedQuestionId` on existing AI turns, and
-        passes only the remaining (unasked) questions to `callModelForBankSelection`.
+        On each turn, bank questions are fetched from the `questions` table filtered by
+        `job_id = session.jobId` via `prisma.question.findMany({ where: { jobId } })`.
+        The route then computes which questions have already been asked by inspecting
+        `Turn.decisionState.selectedQuestionId` on existing AI turns, and passes only
+        the remaining (unasked) questions to `callModelForBankSelection`.
 
         **Bank-exhausted path** — When all bank questions have been asked AND at least 6
         AI turns have been saved, the route returns a static closing statement without
@@ -559,8 +560,9 @@ paths:
         next question (optionally rephrasing it for natural flow), and returns the
         selected question's ID (`selectedQuestionId`) along with tracking fields
         (`detectedSkills`, `coveredTopics`, `remainingGaps`, `questionRationale`). The
-        `selectedQuestionId` is stored in the AI turn's `decisionState` to enforce the
-        no-repeat guarantee on subsequent turns.
+        `selectedQuestionId` references a row in the `questions` table (e.g., `qb-swe-001`)
+        and is stored in the AI turn's `decisionState` to enforce the no-repeat guarantee
+        on subsequent turns.
 
         `decisionState` is always a structured object in the response — it is never null.
         When the interview is complete, `selectedQuestionId` is `null` in `decisionState`.
@@ -601,32 +603,34 @@ paths:
                     type: boolean
                     example: false
                   decisionState:
-                    type: object
-                    required: [selectedQuestionId, detectedSkills, coveredTopics, remainingGaps, questionRationale]
-                    properties:
-                      selectedQuestionId:
-                        oneOf:
-                          - type: string
-                            example: "sqb-swe-004"
-                          - type: 'null'
-                      detectedSkills:
-                        type: array
-                        items:
-                          type: string
-                        example: ["TypeScript", "API Design"]
-                      coveredTopics:
-                        type: array
-                        items:
-                          type: string
-                        example: ["Background", "Technical Experience"]
-                      remainingGaps:
-                        type: array
-                        items:
-                          type: string
-                        example: ["System Design", "Team Collaboration"]
-                      questionRationale:
-                        type: string
-                        example: "Candidate demonstrated TypeScript fluency. Probing system design gap next."
+                    oneOf:
+                      - type: object
+                        required: [selectedQuestionId, detectedSkills, coveredTopics, remainingGaps, questionRationale]
+                        properties:
+                          selectedQuestionId:
+                            oneOf:
+                              - type: string
+                                example: "qb-swe-004"
+                              - type: 'null'
+                          detectedSkills:
+                            type: array
+                            items:
+                              type: string
+                            example: ["TypeScript", "API Design"]
+                          coveredTopics:
+                            type: array
+                            items:
+                              type: string
+                            example: ["Background", "Technical Experience"]
+                          remainingGaps:
+                            type: array
+                            items:
+                              type: string
+                            example: ["System Design", "Team Collaboration"]
+                          questionRationale:
+                            type: string
+                            example: "Candidate demonstrated TypeScript fluency. Probing system design gap next."
+                      - type: 'null'
               examples:
                 inProgress:
                   summary: Interview still in progress (bank question selected with decisionState)
@@ -634,13 +638,19 @@ paths:
                     nextQuestion: "You mentioned distributed systems — can you walk me through how you'd design a rate limiter?"
                     isComplete: false
                     decisionState:
-                      selectedQuestionId: "sqb-swe-004"
+                      selectedQuestionId: "qb-swe-004"
                       detectedSkills: ["TypeScript", "API Design"]
                       coveredTopics: ["Background", "Technical Experience"]
                       remainingGaps: ["System Design", "Team Collaboration"]
                       questionRationale: "Candidate demonstrated TypeScript fluency. Probing system design gap next."
+                openrouterFollowUp:
+                  summary: OpenRouter adaptive follow-up question (decisionState is null)
+                  value:
+                    nextQuestion: "You mentioned struggling with async race conditions — can you walk me through the debugging approach you took?"
+                    isComplete: false
+                    decisionState: null
                 complete:
-                  summary: Interview complete (bank exhausted or model signals completion)
+                  summary: Interview complete (bank exhausted, model signals completion, or static close)
                   value:
                     nextQuestion: "Thank you for your time today. We've covered all the key areas — we'll be in touch with next steps."
                     isComplete: true

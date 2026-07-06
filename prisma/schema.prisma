@@ -28,6 +28,7 @@ model Job {
   seniority    Seniority @default(MID)
   skills       Skill[]
   sessions     Session[]
+  questions    Question[]
   createdAt    DateTime  @default(now()) @map("created_at")
 
   @@map("jobs")
@@ -47,11 +48,13 @@ model Skill {
 
 model Question {
   id        String       @id @default(cuid())
-  skillId   String       @map("skill_id")
+  jobId     String?      @map("job_id")
+  skillId   String?      @map("skill_id")
   text      String
   seniority Seniority?
   type      QuestionType
-  skill     Skill        @relation(fields: [skillId], references: [id], onDelete: Cascade)
+  job       Job?         @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  skill     Skill?       @relation(fields: [skillId], references: [id], onDelete: SetNull)
   createdAt DateTime     @default(now()) @map("created_at")
 
   @@map("questions")

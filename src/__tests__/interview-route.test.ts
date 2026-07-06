@@ -2,7 +2,7 @@
  * Unit tests for POST /api/interview (bank-based question selection)
  *
  * Uses jest.unstable_mockModule (ESM-compatible) with dynamic imports.
- * Mocks: @/lib/prisma, @/lib/bank-selection, @/lib/question-bank
+ * Mocks: @/lib/prisma, @/lib/bank-selection, @/lib/openrouter
  *
  * Note: T8 (wave 4) adds additional test cases on top of this updated baseline.
  */
@@ -50,7 +50,10 @@ const mockTransaction = jest.fn<(ops: unknown) => Promise<unknown[]>>();
 
 const mockCallModelForBankSelection = jest.fn<() => Promise<BankSelectionResponse>>();
 const mockBuildBankSelectionPrompt = jest.fn<() => string>().mockReturnValue('mock-bank-system-prompt');
-const mockGetStaticQuestionBank = jest.fn<() => BankQuestion[]>();
+const mockQuestionFindMany = jest.fn<
+  (args: unknown) => Promise<Array<{ id: string; text: string; type: string }>>
+>();
+const mockGenerateAdaptiveFollowUp = jest.fn<() => Promise<string | null>>();
 
 // ── Register ESM-compatible module mocks ──────────────────────────────────────
 
@@ -64,6 +67,7 @@ jest.unstable_mockModule('@/lib/prisma', () => ({
       create: mockTurnCreate,
       findMany: mockTurnFindMany,
     },
+    question: { findMany: mockQuestionFindMany },
     $transaction: mockTransaction,
   },
 }));
@@ -73,9 +77,8 @@ jest.unstable_mockModule('@/lib/bank-selection', () => ({
   buildBankSelectionPrompt: mockBuildBankSelectionPrompt,
 }));
 
-jest.unstable_mockModule('@/lib/question-bank', () => ({
-  getStaticQuestionBank: mockGetStaticQuestionBank,
-  QUESTION_BANKS: {},
+jest.unstable_mockModule('@/lib/openrouter', () => ({
+  generateAdaptiveFollowUp: mockGenerateAdaptiveFollowUp,
 }));
 
 // Keep anthropic mock for backward compat with any residual imports
@@ -131,8 +134,8 @@ const mockBankResponse: BankSelectionResponse = {
 };
 
 const defaultBank: BankQuestion[] = [
-  { id: 'sqb-swe-001', text: 'Q1', type: 'TECHNICAL', skill: 'TypeScript' },
-  { id: 'sqb-swe-002', text: 'Q2', type: 'BEHAVIORAL', skill: 'Teamwork' },
+  { id: 'sqb-swe-001', text: 'Q1', type: 'TECHNICAL' },
+  { id: 'sqb-swe-002', text: 'Q2', type: 'BEHAVIORAL' },
 ];
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -145,9 +148,11 @@ describe('POST /api/interview', () => {
     mockTurnCreate.mockResolvedValue({ id: 'turn_new' });
     mockTransaction.mockResolvedValue([]);
     mockSessionUpdate.mockResolvedValue({ id: 'session_id_123', status: 'COMPLETED' });
-    mockGetStaticQuestionBank.mockReturnValue(defaultBank);
+    mockQuestionFindMany.mockResolvedValue(defaultBank);
     mockCallModelForBankSelection.mockResolvedValue(mockBankResponse);
     mockBuildBankSelectionPrompt.mockReturnValue('mock-bank-system-prompt');
+    // Default: OpenRouter unavailable / returns null (graceful degradation)
+    mockGenerateAdaptiveFollowUp.mockResolvedValue(null);
   });
 
   // ── Validation ──────────────────────────────────────────────────────────────
@@ -288,15 +293,15 @@ describe('POST /api/interview', () => {
       expect(mockTurnCreate).toHaveBeenCalledTimes(3);
     });
 
-    it('saves USER turn in one $transaction on a subsequent call, then saves bank AI response via turn.create', async () => {
+    it('saves USER turn via direct turn.create on a subsequent call, then saves bank AI response via turn.create', async () => {
       // Simulate an existing AI turn so hasAiTurns = true
       mockTurnFindMany.mockResolvedValue([
         { id: 'turn_1', sessionId: 'session_id_123', speaker: 'AI', content: 'First Q', source: 'ANTHROPIC', decisionState: null, createdAt: new Date() },
       ]);
       await POST(makeRequest(VALID_BODY));
-      // Once for USER turn save (in $transaction)
-      expect(mockTransaction).toHaveBeenCalledTimes(1);
-      // turn.create called: once inside $transaction (USER), once directly (bank AI question)
+      // Subsequent user turn is saved via direct turn.create (NOT in $transaction)
+      expect(mockTransaction).toHaveBeenCalledTimes(0);
+      // turn.create called twice: once for USER turn, once for bank AI question
       expect(mockTurnCreate).toHaveBeenCalledTimes(2);
     });
 
@@ -348,7 +353,7 @@ describe('POST /api/interview', () => {
       await POST(makeRequest(VALID_BODY));
       // buildBankSelectionPrompt is called with the remaining questions
       // The first argument is jobTitle, second is description, third is remainingQuestions
-      const promptCall = mockBuildBankSelectionPrompt.mock.calls[0] as [string, string, BankQuestion[], number];
+      const promptCall = mockBuildBankSelectionPrompt.mock.calls[0] as unknown as [string, string, BankQuestion[], number];
       const remainingQuestions = promptCall[2];
       // sqb-swe-001 should be excluded, only sqb-swe-002 remains
       expect(remainingQuestions.every((q: BankQuestion) => q.id !== 'sqb-swe-001')).toBe(true);
@@ -360,7 +365,7 @@ describe('POST /api/interview', () => {
 
   describe('bank-exhausted path', () => {
     it('returns isComplete true and does NOT call model when bank is empty and aiTurnCount >= 6', async () => {
-      mockGetStaticQuestionBank.mockReturnValue([]);
+      mockQuestionFindMany.mockResolvedValue([]);
       // Simulate 6 existing AI turns
       const aiTurns = Array.from({ length: 6 }, (_, i) => ({
         id: `turn_ai_${i}`,
@@ -381,7 +386,7 @@ describe('POST /api/interview', () => {
     });
 
     it('returns the static decisionState when bank is exhausted and aiTurnCount >= 6', async () => {
-      mockGetStaticQuestionBank.mockReturnValue([]);
+      mockQuestionFindMany.mockResolvedValue([]);
       const aiTurns = Array.from({ length: 6 }, (_, i) => ({
         id: `turn_ai_${i}`,
         sessionId: 'session_id_123',

@@ -1,4 +1,4 @@
-import type { BankQuestion } from '@/lib/question-bank';
+import type { BankQuestion } from '@/types';
 import type { BankSelectionResponse } from '@/types';
 import { aiClient } from '@/lib/ai-client';
 
@@ -27,7 +27,7 @@ export function buildBankSelectionPrompt(
   let questionsSection: string;
   if (remainingQuestions.length > 0) {
     const questionLines = remainingQuestions
-      .map((q) => `[id: ${q.id}] (${q.type} | ${q.skill}) ${q.text}`)
+      .map((q) => `[id: ${q.id}] (${q.type}) ${q.text}`)
       .join('\n');
     questionsSection = `## Available Questions\n\nThe following questions are available for you to select from:\n\n${questionLines}`;
   } else {

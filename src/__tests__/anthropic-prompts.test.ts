@@ -8,9 +8,16 @@
 
 import { jest, describe, it, expect } from '@jest/globals';
 
-// ── Suppress Anthropic SDK initialization ─────────────────────────────────────
-// The anthropic singleton is created at module-load time. Mocking the SDK here
-// prevents async credential-loading from running after Jest teardown.
+// ── Suppress AI client and Anthropic SDK initialization ──────────────────────
+// @/lib/anthropic imports @/lib/ai-client which validates API keys at load time.
+// Mock @/lib/ai-client to prevent that validation from running in tests.
+// Also mock @anthropic-ai/sdk for belt-and-suspenders safety.
+
+jest.unstable_mockModule('@/lib/ai-client', () => ({
+  aiClient: {
+    complete: jest.fn(),
+  },
+}));
 
 jest.unstable_mockModule('@anthropic-ai/sdk', () => ({
   default: jest.fn().mockImplementation(() => ({
@@ -18,7 +25,7 @@ jest.unstable_mockModule('@anthropic-ai/sdk', () => ({
   })),
 }));
 
-// Dynamic import after mock is registered
+// Dynamic import after mocks are registered
 const {
   buildInterviewSystemPrompt,
   buildEvaluationPrompt,

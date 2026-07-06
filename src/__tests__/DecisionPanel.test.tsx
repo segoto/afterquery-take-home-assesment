@@ -6,6 +6,7 @@ import { render, screen } from '@testing-library/react';
 import { DecisionPanel } from '@/components/DecisionPanel';
 
 const sampleDecisionState = {
+  selectedQuestionId: null,
   detectedSkills: ['TypeScript', 'React'],
   coveredTopics: ['Background'],
   remainingGaps: ['System Design'],
