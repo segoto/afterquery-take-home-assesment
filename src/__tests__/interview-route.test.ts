@@ -1,25 +1,27 @@
 /**
- * Unit tests for POST /api/interview (synchronous Claude integration)
+ * Unit tests for POST /api/interview (bank-based question selection)
  *
  * Uses jest.unstable_mockModule (ESM-compatible) with dynamic imports.
- * Mocks: @/lib/prisma, @/lib/anthropic
+ * Mocks: @/lib/prisma, @/lib/bank-selection, @/lib/question-bank
+ *
+ * Note: T8 (wave 4) adds additional test cases on top of this updated baseline.
  */
 
 import { jest, describe, it, expect, beforeEach } from '@jest/globals';
 import { NextRequest } from 'next/server';
-import type { ClaudeInterviewResponse } from '@/types';
+import type { BankSelectionResponse, BankQuestion } from '@/types';
 
 // ── Mock functions ─────────────────────────────────────────────────────────────
 
 const mockSessionFindUnique = jest.fn<
   (args: unknown) => Promise<{
     id: string;
+    jobId: string;
     status: string;
     job: {
       id: string;
       title: string;
       description: string;
-      skills: Array<{ id: string; name: string; weight: number }>;
     };
   } | null>
 >();
@@ -37,6 +39,8 @@ const mockTurnFindMany = jest.fn<
       sessionId: string;
       speaker: string;
       content: string;
+      source?: string | null;
+      decisionState?: Record<string, unknown> | null;
       createdAt: Date;
     }>
   >
@@ -44,8 +48,9 @@ const mockTurnFindMany = jest.fn<
 
 const mockTransaction = jest.fn<(ops: unknown) => Promise<unknown[]>>();
 
-const mockCallClaudeForNextQuestion = jest.fn<() => Promise<ClaudeInterviewResponse>>();
-const mockBuildInterviewSystemPrompt = jest.fn<() => string>().mockReturnValue('mock-system-prompt');
+const mockCallModelForBankSelection = jest.fn<() => Promise<BankSelectionResponse>>();
+const mockBuildBankSelectionPrompt = jest.fn<() => string>().mockReturnValue('mock-bank-system-prompt');
+const mockGetStaticQuestionBank = jest.fn<() => BankQuestion[]>();
 
 // ── Register ESM-compatible module mocks ──────────────────────────────────────
 
@@ -63,10 +68,21 @@ jest.unstable_mockModule('@/lib/prisma', () => ({
   },
 }));
 
+jest.unstable_mockModule('@/lib/bank-selection', () => ({
+  callModelForBankSelection: mockCallModelForBankSelection,
+  buildBankSelectionPrompt: mockBuildBankSelectionPrompt,
+}));
+
+jest.unstable_mockModule('@/lib/question-bank', () => ({
+  getStaticQuestionBank: mockGetStaticQuestionBank,
+  QUESTION_BANKS: {},
+}));
+
+// Keep anthropic mock for backward compat with any residual imports
 jest.unstable_mockModule('@/lib/anthropic', () => ({
-  callClaudeForNextQuestion: mockCallClaudeForNextQuestion,
-  buildInterviewSystemPrompt: mockBuildInterviewSystemPrompt,
+  buildInterviewSystemPrompt: jest.fn().mockReturnValue('mock-system-prompt'),
   buildEvaluationPrompt: jest.fn().mockReturnValue('mocked evaluation prompt'),
+  callClaudeForNextQuestion: jest.fn(),
   INTERVIEW_COMPLETE_SENTINEL: '[INTERVIEW_COMPLETE]',
   anthropic: {},
 }));
@@ -95,25 +111,29 @@ const validJob = {
   id: 'job_id_123',
   title: 'Software Engineer',
   description: 'Test description',
-  skills: [] as Array<{ id: string; name: string; weight: number }>,
 };
 
 const validSession = {
   id: 'session_id_123',
+  jobId: 'job_id_123',
   status: 'IN_PROGRESS',
   job: validJob,
 };
 
-const mockClaudeResponse: ClaudeInterviewResponse = {
+const mockBankResponse: BankSelectionResponse = {
+  selectedQuestionId: 'sqb-swe-001',
   question: 'Next AI question',
   isComplete: false,
-  decisionState: {
-    detectedSkills: ['TypeScript'],
-    coveredTopics: ['Background'],
-    remainingGaps: ['System Design'],
-    questionRationale: 'Probing system design next.',
-  },
+  detectedSkills: ['TypeScript'],
+  coveredTopics: ['Background'],
+  remainingGaps: ['System Design'],
+  questionRationale: 'Probing system design next.',
 };
+
+const defaultBank: BankQuestion[] = [
+  { id: 'sqb-swe-001', text: 'Q1', type: 'TECHNICAL', skill: 'TypeScript' },
+  { id: 'sqb-swe-002', text: 'Q2', type: 'BEHAVIORAL', skill: 'Teamwork' },
+];
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -125,8 +145,9 @@ describe('POST /api/interview', () => {
     mockTurnCreate.mockResolvedValue({ id: 'turn_new' });
     mockTransaction.mockResolvedValue([]);
     mockSessionUpdate.mockResolvedValue({ id: 'session_id_123', status: 'COMPLETED' });
-    mockCallClaudeForNextQuestion.mockResolvedValue(mockClaudeResponse);
-    mockBuildInterviewSystemPrompt.mockReturnValue('mock-system-prompt');
+    mockGetStaticQuestionBank.mockReturnValue(defaultBank);
+    mockCallModelForBankSelection.mockResolvedValue(mockBankResponse);
+    mockBuildBankSelectionPrompt.mockReturnValue('mock-bank-system-prompt');
   });
 
   // ── Validation ──────────────────────────────────────────────────────────────
@@ -224,8 +245,8 @@ describe('POST /api/interview', () => {
   // ── AI service error ────────────────────────────────────────────────────────
 
   describe('AI service error', () => {
-    it('returns 500 with AI-specific message when callClaudeForNextQuestion throws', async () => {
-      mockCallClaudeForNextQuestion.mockRejectedValue(new Error('Claude unavailable'));
+    it('returns 500 with AI-specific message when callModelForBankSelection throws', async () => {
+      mockCallModelForBankSelection.mockRejectedValue(new Error('model unavailable'));
       const res = await POST(makeRequest(VALID_BODY));
       expect(res.status).toBe(500);
       const body = await res.json();
@@ -244,6 +265,7 @@ describe('POST /api/interview', () => {
         nextQuestion: 'Next AI question',
         isComplete: false,
         decisionState: {
+          selectedQuestionId: 'sqb-swe-001',
           detectedSkills: ['TypeScript'],
           coveredTopics: ['Background'],
           remainingGaps: ['System Design'],
@@ -257,39 +279,129 @@ describe('POST /api/interview', () => {
       expect(res.headers.get('content-type')).toContain('application/json');
     });
 
-    it('calls $transaction to save user answer (first turn: saves AI + USER turns)', async () => {
-      // No existing turns => hasAiTurns = false => should save AI turn + USER turn
+    it('saves AI + USER turns in one $transaction on the first call, then saves bank AI response via turn.create', async () => {
+      // No existing turns => hasAiTurns = false => first $transaction saves AI + USER turns
+      // model returns isComplete: false => AI turn saved via prisma.turn.create (not $transaction)
       await POST(makeRequest(VALID_BODY));
-      expect(mockTransaction).toHaveBeenCalledTimes(2);
+      expect(mockTransaction).toHaveBeenCalledTimes(1);
+      // turn.create is called inside $transaction (AI + USER) AND directly (next AI question)
+      expect(mockTurnCreate).toHaveBeenCalledTimes(3);
     });
 
-    it('calls $transaction once for user answer and once for Claude response (subsequent turn)', async () => {
+    it('saves USER turn in one $transaction on a subsequent call, then saves bank AI response via turn.create', async () => {
       // Simulate an existing AI turn so hasAiTurns = true
       mockTurnFindMany.mockResolvedValue([
-        { id: 'turn_1', sessionId: 'session_id_123', speaker: 'AI', content: 'First Q', createdAt: new Date() },
+        { id: 'turn_1', sessionId: 'session_id_123', speaker: 'AI', content: 'First Q', source: 'ANTHROPIC', decisionState: null, createdAt: new Date() },
       ]);
       await POST(makeRequest(VALID_BODY));
-      // Once for USER turn save, once for AI turn save
-      expect(mockTransaction).toHaveBeenCalledTimes(2);
+      // Once for USER turn save (in $transaction)
+      expect(mockTransaction).toHaveBeenCalledTimes(1);
+      // turn.create called: once inside $transaction (USER), once directly (bank AI question)
+      expect(mockTurnCreate).toHaveBeenCalledTimes(2);
     });
 
-    it('marks session COMPLETED and calls $transaction twice when isComplete is true', async () => {
-      mockCallClaudeForNextQuestion.mockResolvedValue({
-        question: 'Thank you!',
+    it('saves AI turn with decisionState.selectedQuestionId matching mock return value', async () => {
+      await POST(makeRequest(VALID_BODY));
+      // The direct turn.create call (the last one) should have decisionState with selectedQuestionId
+      const lastCreateCall = mockTurnCreate.mock.calls[mockTurnCreate.mock.calls.length - 1] as Array<{
+        data: { decisionState?: { selectedQuestionId?: string } };
+      }>;
+      const createArgs = lastCreateCall[0];
+      expect(createArgs.data.decisionState).toMatchObject({ selectedQuestionId: 'sqb-swe-001' });
+    });
+
+    it('marks session COMPLETED and calls $transaction twice when model signals isComplete: true', async () => {
+      mockCallModelForBankSelection.mockResolvedValue({
+        selectedQuestionId: null,
+        question: 'Thank you for your time today!',
         isComplete: true,
-        decisionState: {
-          detectedSkills: ['TypeScript'],
-          coveredTopics: ['Background'],
-          remainingGaps: [],
-          questionRationale: 'All covered.',
-        },
+        detectedSkills: ['TypeScript'],
+        coveredTopics: ['Background'],
+        remainingGaps: [],
+        questionRationale: 'All covered.',
       });
       const res = await POST(makeRequest(VALID_BODY));
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.isComplete).toBe(true);
-      // session.update called as part of the post-Claude transaction
+      // $transaction called: once for first-turn AI+USER save, once for closing+session update
       expect(mockTransaction).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  // ── No-repeat guarantee ─────────────────────────────────────────────────────
+
+  describe('no-repeat guarantee', () => {
+    it('excludes already-asked question IDs from the bank passed to callModelForBankSelection', async () => {
+      // Simulate an existing AI turn with selectedQuestionId = 'sqb-swe-001'
+      mockTurnFindMany.mockResolvedValue([
+        {
+          id: 'turn_1',
+          sessionId: 'session_id_123',
+          speaker: 'AI',
+          content: 'Q1 text',
+          source: 'ANTHROPIC',
+          decisionState: { selectedQuestionId: 'sqb-swe-001', detectedSkills: [], coveredTopics: [], remainingGaps: [], questionRationale: '' },
+          createdAt: new Date(),
+        },
+      ]);
+      await POST(makeRequest(VALID_BODY));
+      // buildBankSelectionPrompt is called with the remaining questions
+      // The first argument is jobTitle, second is description, third is remainingQuestions
+      const promptCall = mockBuildBankSelectionPrompt.mock.calls[0] as [string, string, BankQuestion[], number];
+      const remainingQuestions = promptCall[2];
+      // sqb-swe-001 should be excluded, only sqb-swe-002 remains
+      expect(remainingQuestions.every((q: BankQuestion) => q.id !== 'sqb-swe-001')).toBe(true);
+      expect(remainingQuestions.some((q: BankQuestion) => q.id === 'sqb-swe-002')).toBe(true);
+    });
+  });
+
+  // ── Bank-exhausted path ─────────────────────────────────────────────────────
+
+  describe('bank-exhausted path', () => {
+    it('returns isComplete true and does NOT call model when bank is empty and aiTurnCount >= 6', async () => {
+      mockGetStaticQuestionBank.mockReturnValue([]);
+      // Simulate 6 existing AI turns
+      const aiTurns = Array.from({ length: 6 }, (_, i) => ({
+        id: `turn_ai_${i}`,
+        sessionId: 'session_id_123',
+        speaker: 'AI',
+        content: `AI question ${i}`,
+        source: 'ANTHROPIC',
+        decisionState: null,
+        createdAt: new Date(),
+      }));
+      mockTurnFindMany.mockResolvedValue(aiTurns);
+
+      const res = await POST(makeRequest(VALID_BODY));
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.isComplete).toBe(true);
+      expect(mockCallModelForBankSelection).not.toHaveBeenCalled();
+    });
+
+    it('returns the static decisionState when bank is exhausted and aiTurnCount >= 6', async () => {
+      mockGetStaticQuestionBank.mockReturnValue([]);
+      const aiTurns = Array.from({ length: 6 }, (_, i) => ({
+        id: `turn_ai_${i}`,
+        sessionId: 'session_id_123',
+        speaker: 'AI',
+        content: `AI question ${i}`,
+        source: 'ANTHROPIC',
+        decisionState: null,
+        createdAt: new Date(),
+      }));
+      mockTurnFindMany.mockResolvedValue(aiTurns);
+
+      const res = await POST(makeRequest(VALID_BODY));
+      const body = await res.json();
+      expect(body.decisionState).toEqual({
+        selectedQuestionId: null,
+        detectedSkills: [],
+        coveredTopics: [],
+        remainingGaps: [],
+        questionRationale: 'Bank fully covered. Interview closed.',
+      });
     });
   });
 

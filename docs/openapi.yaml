@@ -541,12 +541,29 @@ paths:
       description: |
         Accepts the candidate's spoken answer for the current turn. Validates the session
         is IN_PROGRESS, saves the user answer turn (and the initial AI question turn if
-        this is the first call for the session), then makes a synchronous (non-streaming)
-        call to the Claude API to generate the next interview question. Returns a structured
-        JSON response containing the next question, a completion flag, and a `decisionState`
-        block describing the AI's current understanding of the interview coverage.
+        this is the first call for the session), then uses adaptive bank-based question
+        selection via `callModelForBankSelection` (routes to OpenRouter when
+        `AI_PROVIDER=openrouter`) to determine the next interview question.
 
-        If `isComplete` is true, the session is also marked as COMPLETED in the database.
+        The route loads the static question bank for the session's job via
+        `getStaticQuestionBank`, computes which questions have already been asked by
+        inspecting `Turn.decisionState.selectedQuestionId` on existing AI turns, and
+        passes only the remaining (unasked) questions to `callModelForBankSelection`.
+
+        **Bank-exhausted path** — When all bank questions have been asked AND at least 6
+        AI turns have been saved, the route returns a static closing statement without
+        calling the AI model. The session is marked `COMPLETED` in a single transaction.
+
+        **Normal path** — `callModelForBankSelection` receives the remaining bank
+        questions and full conversation history, selects the most contextually appropriate
+        next question (optionally rephrasing it for natural flow), and returns the
+        selected question's ID (`selectedQuestionId`) along with tracking fields
+        (`detectedSkills`, `coveredTopics`, `remainingGaps`, `questionRationale`). The
+        `selectedQuestionId` is stored in the AI turn's `decisionState` to enforce the
+        no-repeat guarantee on subsequent turns.
+
+        `decisionState` is always a structured object in the response — it is never null.
+        When the interview is complete, `selectedQuestionId` is `null` in `decisionState`.
 
         The `turnNumber` field is silently ignored if present in the request body.
       requestBody:
@@ -585,8 +602,13 @@ paths:
                     example: false
                   decisionState:
                     type: object
-                    required: [detectedSkills, coveredTopics, remainingGaps, questionRationale]
+                    required: [selectedQuestionId, detectedSkills, coveredTopics, remainingGaps, questionRationale]
                     properties:
+                      selectedQuestionId:
+                        oneOf:
+                          - type: string
+                            example: "sqb-swe-004"
+                          - type: 'null'
                       detectedSkills:
                         type: array
                         items:
@@ -607,25 +629,27 @@ paths:
                         example: "Candidate demonstrated TypeScript fluency. Probing system design gap next."
               examples:
                 inProgress:
-                  summary: Interview still in progress
+                  summary: Interview still in progress (bank question selected with decisionState)
                   value:
                     nextQuestion: "You mentioned distributed systems — can you walk me through how you'd design a rate limiter?"
                     isComplete: false
                     decisionState:
+                      selectedQuestionId: "sqb-swe-004"
                       detectedSkills: ["TypeScript", "API Design"]
                       coveredTopics: ["Background", "Technical Experience"]
                       remainingGaps: ["System Design", "Team Collaboration"]
                       questionRationale: "Candidate demonstrated TypeScript fluency. Probing system design gap next."
                 complete:
-                  summary: Interview complete
+                  summary: Interview complete (bank exhausted or model signals completion)
                   value:
                     nextQuestion: "Thank you for your time today. We've covered all the key areas — we'll be in touch with next steps."
                     isComplete: true
                     decisionState:
-                      detectedSkills: ["TypeScript", "API Design", "System Design", "Team Collaboration"]
-                      coveredTopics: ["Background", "Technical Experience", "System Design", "Collaboration & Leadership"]
+                      selectedQuestionId: null
+                      detectedSkills: ["TypeScript", "API Design", "System Design", "Debugging"]
+                      coveredTopics: ["Background", "Technical Experience", "Behavioral", "Problem Solving"]
                       remainingGaps: []
-                      questionRationale: "All required skills have been assessed and at least 6 questions asked. Closing the interview."
+                      questionRationale: "All required competencies covered after 7 questions. Closing the interview."
         '400':
           description: Validation error — missing or invalid field.
           content:
@@ -671,7 +695,7 @@ paths:
                     type: string
               examples:
                 aiUnavailable:
-                  summary: Claude API call failed or response could not be parsed
+                  summary: callModelForBankSelection threw (JSON parse error, network error, or AI API error)
                   value:
                     error: "AI service unavailable. Please try again."
                 internalError:

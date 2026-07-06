@@ -81,7 +81,18 @@ function makeSessionErrorResponse(
 
 function makeInterviewResponse(
   nextQuestion = 'Next question',
-  isComplete = false
+  isComplete = false,
+  decisionState: {
+    detectedSkills: string[];
+    coveredTopics: string[];
+    remainingGaps: string[];
+    questionRationale: string;
+  } | null = {
+    detectedSkills: ['TypeScript'],
+    coveredTopics: ['Background'],
+    remainingGaps: ['System Design'],
+    questionRationale: 'Probing system design.',
+  }
 ): Response {
   return {
     ok: true,
@@ -90,12 +101,7 @@ function makeInterviewResponse(
       Promise.resolve({
         nextQuestion,
         isComplete,
-        decisionState: {
-          detectedSkills: ['TypeScript'],
-          coveredTopics: ['Background'],
-          remainingGaps: ['System Design'],
-          questionRationale: 'Probing system design.',
-        },
+        decisionState,
       }),
   } as unknown as Response;
 }
@@ -435,6 +441,36 @@ describe('InterviewRoom', () => {
         })
       );
     });
+  });
+
+  // ── 15. TURN_SAVED with decisionState: null does not throw ───────────────────
+
+  it('handles TURN_SAVED with decisionState: null without error', async () => {
+    const NEXT_Q = 'Can you elaborate on your debugging approach?';
+    const mockFetch = createFetchMock();
+    mockFetch
+      .mockResolvedValueOnce(makeSessionResponse())
+      // OpenRouter follow-up: decisionState is null
+      .mockResolvedValueOnce(makeInterviewResponse(NEXT_Q, false, null));
+    global.fetch = mockFetch;
+
+    render(<InterviewRoom job={VALID_JOB} />);
+
+    // Wait for awaiting_recording phase
+    await waitFor(() => {
+      expect(screen.getByTestId('mock-record-button')).toBeInTheDocument();
+    });
+
+    // Trigger turn submission
+    fireEvent.click(screen.getByTestId('mock-record-button'));
+
+    // The component should transition to awaiting_recording with the follow-up question,
+    // and decisionState: null must not cause a runtime exception.
+    await waitFor(() => {
+      expect(screen.getByText(NEXT_Q)).toBeInTheDocument();
+    });
+
+    expect(screen.queryByText('Interview complete.')).not.toBeInTheDocument();
   });
 
 });

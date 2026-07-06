@@ -1,3 +1,5 @@
+export type { BankQuestion } from '@/lib/question-bank';
+
 // The minimal user shape returned to clients
 export interface AuthUser {
   id: string;
@@ -130,6 +132,17 @@ export interface PostInterviewSuccessResponse {
 }
 
 export interface DecisionState {
+  selectedQuestionId: string | null;
+  detectedSkills: string[];
+  coveredTopics: string[];
+  remainingGaps: string[];
+  questionRationale: string;
+}
+
+export interface BankSelectionResponse {
+  selectedQuestionId: string | null;
+  question: string;
+  isComplete: boolean;
   detectedSkills: string[];
   coveredTopics: string[];
   remainingGaps: string[];

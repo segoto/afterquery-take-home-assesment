@@ -10,7 +10,7 @@ import type {
   InterviewRoomState,
   InterviewRoomAction,
   PostSessionResponse,
-  PostInterviewResponse,
+  PostInterviewSuccessResponse,
 } from '@/types';
 
 const INITIAL_QUESTION =
@@ -210,7 +210,7 @@ export function InterviewRoom({ job }: InterviewRoomProps) {
           });
           return;
         }
-        const data = (await res.json()) as PostInterviewResponse;
+        const data = (await res.json()) as PostInterviewSuccessResponse;
         if (cancelled) return;
         dispatch({
           type: 'TURN_SAVED',

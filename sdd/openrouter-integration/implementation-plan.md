@@ -1,389 +1,478 @@
-# Implementation Plan: OpenRouter Integration
+# Implementation Plan: OpenRouter Integration — Adaptive Follow-Up Questions
 
 ## Overview
 
-This feature introduces a provider-agnostic AI client abstraction (`src/lib/ai-client.ts`) that routes AI calls to either Anthropic (via `@anthropic-ai/sdk`) or OpenRouter (via the `openai` package) depending on the `AI_PROVIDER` environment variable. Alongside the new abstraction, the `/api/interview` route is rewritten to stream real AI responses as `text/plain`, a new `/api/evaluate` route is created for post-interview scoring, and `InterviewRoom.tsx` is updated to consume the streaming interview response.
+After the Anthropic-driven main interview concludes (Claude signals `isComplete: true` internally), the `POST /api/interview` route generates up to 2 additional adaptive follow-up questions via a dedicated OpenRouter client before returning `isComplete: true` to the candidate. Phase routing is determined by counting existing `OPENROUTER`-sourced AI `Turn` rows; the `Turn` model gains a nullable `TurnSource` enum field to track AI provenance.
 
 ## Prerequisites
 
-- No Prisma schema changes are required. The existing `Session`, `Turn`, and `Evaluation` models are sufficient.
-- No seed data changes are required.
-- The `@anthropic-ai/sdk` and `openai` npm packages must be installed (handled in T1) before any AI client code is written.
-- At runtime, at least one of `ANTHROPIC_API_KEY` (when `AI_PROVIDER=anthropic` or unset) or `OPENROUTER_API_KEY` (when `AI_PROVIDER=openrouter`) must be present in the environment.
+- PostgreSQL must be running and `DATABASE_URL` set. The Prisma migration added in T1 must be applied before T4 can be deployed or tested end-to-end.
+- `OPENROUTER_API_KEY` is optional at runtime — its absence triggers graceful degradation; the server still starts normally without it.
+- The `openai` npm package (v6.45.0) is already installed. No new dependency is needed.
 
 ## Task Graph
 
-| Task | Wave | Type | Description | Depends on |
-|------|------|------|-------------|------------|
-| T1 | 1 | backend | Install `@anthropic-ai/sdk` and `openai` npm packages; update `.env.example` | — |
-| T2 | 1 | backend | Create `src/lib/anthropic.ts` with prompt-builder functions | — |
-| T3 | 2 | backend | Create `src/lib/ai-client.ts` — provider-agnostic singleton with `streamCompletion` and `complete` | T1 |
-| T4 | 3 | backend | Rewrite `src/app/api/interview/route.ts` to use real AI streaming via `aiClient`; rewrite `src/__tests__/interview-route.test.ts` | T2, T3 |
-| T5 | 3 | backend | Create `src/app/api/evaluate/route.ts`; create `src/__tests__/evaluate-route.test.ts` | T2, T3 |
-| T6 | 4 | frontend | Update `src/components/InterviewRoom.tsx` to consume streaming response; remove `PostInterviewResponse` from `src/types/index.ts` | T4 |
-| T7 | 4 | backend | Update `docs/openapi.yaml` for the `/api/interview` streaming format and the new `/api/evaluate` endpoint | T4, T5 |
+| Task | Wave | Type     | Description                                                                                     | Depends on   |
+|------|------|----------|-------------------------------------------------------------------------------------------------|--------------|
+| T1   | 1    | backend  | Prisma schema: add `TurnSource` enum and nullable `source` field to `Turn`; create migration    | —            |
+| T2   | 1    | backend  | Create `src/lib/openrouter.ts` with `generateAdaptiveFollowUp`; add `OPENROUTER_FOLLOWUP_MODEL` to `.env.example` | — |
+| T3   | 1    | backend  | Add `PostInterviewSuccessResponse` interface to `src/types/index.ts`                           | —            |
+| T4   | 2    | backend  | Rewrite `POST /api/interview` route with phase routing; update `docs/openapi.yaml`              | T1, T2, T3  |
+| T5   | 2    | frontend | Update `InterviewRoom.tsx` type import from `PostInterviewResponse` to `PostInterviewSuccessResponse` | T3      |
 
-Wave 1 tasks (T1, T2) are fully parallel. T3 starts only after T1 completes. T4 and T5 are parallel and start only after T3 (and T2) complete. T6 and T7 are parallel and start only after T4 and T5 complete.
+Wave 1 tasks are fully parallel. Wave 2 tasks start only when all Wave 1 tasks are complete. T4 and T5 within Wave 2 are independent and may run in parallel.
 
 ## Task Details
 
-### T1: Install npm packages and update `.env.example`
+### T1: Prisma schema migration — add `TurnSource` enum and `source` field to `Turn`
 
 - **Type**: backend
 - **Wave**: 1
 - **Files to create or modify**:
-  - `package.json` — add `@anthropic-ai/sdk` and `openai` as production dependencies by running `npm install @anthropic-ai/sdk openai`
-  - `.env.example` — add three new documented entries: `AI_PROVIDER`, `OPENROUTER_API_KEY`, `OPENROUTER_MODEL`
+  - `prisma/schema.prisma` — add `TurnSource` enum; add `source TurnSource?` field to `Turn` model
 - **Implementation notes**:
-  - Run `npm install @anthropic-ai/sdk openai` from the project root. Do not pin to a specific minor version; let npm resolve the latest compatible version.
-  - In `.env.example`, add the following block after the existing `ANTHROPIC_API_KEY` entry:
-    ```
-    # AI provider: "anthropic" (default) or "openrouter"
-    AI_PROVIDER="anthropic"
+  Add the `TurnSource` enum immediately before the existing `Speaker` enum (keep enums grouped):
+  ```prisma
+  enum TurnSource {
+    ANTHROPIC
+    OPENROUTER
+  }
+  ```
+  Add the `source` field to the `Turn` model after the `content` field and before `decisionState`:
+  ```prisma
+  source TurnSource?
+  ```
+  No `@map` directive is needed because the field name `source` is already snake_case and matches the intended DB column name exactly.
 
-    # Required when AI_PROVIDER=openrouter
-    OPENROUTER_API_KEY="sk-or-..."
+  The complete updated `Turn` model must read:
+  ```prisma
+  model Turn {
+    id            String      @id @default(cuid())
+    sessionId     String      @map("session_id")
+    session       Session     @relation(fields: [sessionId], references: [id])
+    speaker       Speaker
+    content       String
+    source        TurnSource?
+    decisionState Json?       @map("decision_state")
+    createdAt     DateTime    @default(now()) @map("created_at")
 
-    # Optional — OpenRouter model identifier; defaults to "anthropic/claude-sonnet-4-6"
-    OPENROUTER_MODEL="anthropic/claude-sonnet-4-6"
-    ```
-  - Do not modify any other file in this task.
+    @@map("turns")
+  }
+  ```
+
+  After editing the schema, run:
+  ```bash
+  npx prisma migrate dev --name add_source_to_turns
+  npx prisma generate
+  ```
+
+  The migration adds the `TurnSource` Postgres enum type and a nullable `source` column to `turns`. Existing rows receive `NULL` for `source`, which is the correct default for pre-existing AI turns and all `USER`-speaker turns.
+
 - **Testing**:
-  - Unit: none — this is a dependency and config task.
-  - Integration: after running `npm install`, confirm `npx tsc --noEmit` still passes with no errors.
-  - Manual: verify that `node_modules/@anthropic-ai/sdk` and `node_modules/openai` exist after install.
+  - Unit: none required for a schema-only migration.
+  - Integration: open Prisma Studio (`npx prisma studio`) after the migration and verify the `turns` table shows a nullable `source` column of the `TurnSource` enum type. Confirm existing rows show `NULL`.
+  - Manual: run `npx tsc --noEmit` to confirm the generated Prisma client exposes `source` as `TurnSource | null` on the `Turn` type with no compilation errors.
 
 ---
 
-### T2: Create `src/lib/anthropic.ts` — prompt builders
+### T2: Create `src/lib/openrouter.ts` and update `.env.example`
 
 - **Type**: backend
 - **Wave**: 1
 - **Files to create or modify**:
-  - `src/lib/anthropic.ts` — new file; exports `buildInterviewSystemPrompt` and `buildEvaluationPrompt`
+  - `src/lib/openrouter.ts` — new server-only file; exports `generateAdaptiveFollowUp`
+  - `.env.example` — add `OPENROUTER_FOLLOWUP_MODEL` optional variable
 - **Implementation notes**:
-  - This file must import only `Job` from `@/types` — no external SDK imports.
-  - `buildInterviewSystemPrompt(job: Job): string` must return a multi-line string that includes all of the following:
-    1. The job title and full description so the AI is grounded in the role.
-    2. A rubric section listing the skills to probe (derive them from the job description; the prompt should instruct the AI to infer the key competencies from the job description it has been given).
-    3. An explicit rule: "You must ask the candidate at least 6 questions in total."
-    4. An adaptive follow-up rule: "Generate at least 2 follow-up questions that probe areas the candidate's prior answers reveal as important or unclear."
-    5. A termination rule: "After your final question, append the token `[INTERVIEW_COMPLETE]` as the very last characters of your response — with no text after it."
-    6. An instruction to ask only one question at a time.
-  - `buildEvaluationPrompt(turns: Array<{ speaker: string; content: string }>): string` must return a string that includes:
-    1. A formatted transcript section with each turn labeled `CANDIDATE:` or `INTERVIEWER:` based on `speaker` value (`USER` → `CANDIDATE`, `AI` → `INTERVIEWER`).
-    2. An instruction: "Based on the interview transcript above, evaluate the candidate. Respond with ONLY valid JSON — no surrounding text, no markdown code fences — containing exactly these keys: `strengths` (array of strings), `concerns` (array of strings), `overall_score` (integer from 1 to 10)."
-  - Both functions must be pure (no side effects, no I/O).
+  Create `src/lib/openrouter.ts`. This file must NOT include a `'use client'` directive and must NOT be barrel-exported through any client-facing index.
+
+  Exported function signature:
+  ```typescript
+  export async function generateAdaptiveFollowUp(
+    transcript: Array<{ speaker: string; content: string }>,
+    followUpIndex: 1 | 2
+  ): Promise<string | null>
+  ```
+
+  Implementation requirements:
+
+  1. **Lazy key check** — at the start of the function body (not at module load), read `process.env.OPENROUTER_API_KEY`. If the value is falsy (absent or empty string), immediately `return null` without throwing. This allows the server to start normally without the key.
+
+  2. **Lazy client construction** — after the key check, instantiate an `OpenAI` client (from the `openai` package, already installed) inside the function body:
+     ```typescript
+     import OpenAI from 'openai';
+
+     const client = new OpenAI({
+       baseURL: 'https://openrouter.ai/api/v1',
+       apiKey: process.env.OPENROUTER_API_KEY,
+       defaultHeaders: {
+         'HTTP-Referer': process.env.NEXT_PUBLIC_APP_URL ?? 'http://localhost:3000',
+         'X-Title': 'AI Interviewer Platform',
+       },
+     });
+     ```
+
+  3. **Model selection** — use `process.env.OPENROUTER_FOLLOWUP_MODEL ?? 'meta-llama/llama-3.1-8b-instruct'`.
+
+  4. **Transcript formatting** — map the `transcript` array into a string where `AI`-speaker entries are labelled `INTERVIEWER` and all other entries are labelled `CANDIDATE`. Join entries with `\n\n`.
+
+  5. **User message** — send a single `user` role message asking the model to generate one concrete, adaptive follow-up question grounded in the candidate's specific answers, indicating this is follow-up number `followUpIndex`. The message must request plain text — not JSON.
+
+  6. **Non-streaming call** — use `client.chat.completions.create({ model, stream: false, messages })` and extract `response.choices[0]?.message?.content ?? ''`.
+
+  7. **Return value** — return the result of `.trim()` on the extracted content string. Return even if the trimmed string is empty; the route handler (T4) checks for empty string.
+
+  8. **Error propagation** — do NOT wrap the `OpenAI` SDK call in try/catch inside this function. Let network errors, rate-limit errors, and 4xx/5xx SDK errors propagate as thrown exceptions. The route handler is responsible for catching them and degrading gracefully.
+
+  For `.env.example`, add the following block after the existing `OPENROUTER_MODEL` line:
+  ```
+  # Optional — model for adaptive follow-up questions; defaults to "meta-llama/llama-3.1-8b-instruct"
+  OPENROUTER_FOLLOWUP_MODEL="meta-llama/llama-3.1-8b-instruct"
+  ```
+
 - **Testing**:
-  - Unit: create `src/__tests__/anthropic-prompts.test.ts`. Test that `buildInterviewSystemPrompt` returns a string containing the job title, the `[INTERVIEW_COMPLETE]` sentinel instruction, the "at least 6 questions" rule, and the "at least 2 follow-up" rule. Test that `buildEvaluationPrompt` formats turns with the correct speaker labels and includes the JSON instruction.
-  - Integration: none — pure functions.
-  - Manual: call both functions with a sample `Job` and log the output; verify the prompts read naturally.
+  - Unit: write `src/__tests__/openrouter.test.ts`. Mock the `openai` module using `jest.unstable_mockModule`. Test: (a) returns `null` without throwing when `OPENROUTER_API_KEY` is absent or empty; (b) calls `chat.completions.create` with `stream: false` and the correct model string; (c) returns the trimmed content string on a successful API call; (d) propagates SDK errors — assert that a thrown SDK error is not swallowed by the function (use `expect(...).rejects.toThrow()`).
+  - Integration: none required at this layer; integration is validated by T4's manual test.
+  - Manual: with a valid `OPENROUTER_API_KEY` set locally, call the function from a one-off script (`npx tsx`) and verify a non-empty question string is returned.
 
 ---
 
-### T3: Create `src/lib/ai-client.ts` — provider-agnostic AI client singleton
+### T3: Add `PostInterviewSuccessResponse` to `src/types/index.ts`
+
+- **Type**: backend
+- **Wave**: 1
+- **Files to create or modify**:
+  - `src/types/index.ts` — add `PostInterviewSuccessResponse` interface after `PostInterviewResponse`
+- **Implementation notes**:
+  Insert the following exported interface immediately after the existing `PostInterviewResponse` interface (currently around line 120):
+  ```typescript
+  export interface PostInterviewSuccessResponse {
+    nextQuestion: string;
+    isComplete: boolean;
+    decisionState: DecisionState | null;
+  }
+  ```
+
+  Do NOT modify `ClaudeInterviewResponse` or `PostInterviewResponse`. `ClaudeInterviewResponse.decisionState` remains `DecisionState` (non-nullable) because it accurately represents Anthropic's structured response shape and the `claudeResponse.decisionState as object` cast used when persisting Anthropic AI turns relies on this being non-nullable. `PostInterviewResponse.decisionState` also remains `DecisionState` (non-nullable) for backward compatibility with existing test snapshots; the route will use `PostInterviewSuccessResponse` instead.
+
+  `PostInterviewSuccessResponse` is the type used as `NextResponse.json<PostInterviewSuccessResponse>()` in all success branches of `POST /api/interview` (T4), explicitly allowing `decisionState: null` for OpenRouter follow-up turns and the static closing statement.
+
+- **Testing**:
+  - Unit: none required for a type-only addition.
+  - Manual: run `npx tsc --noEmit` — must pass with no errors. The interface should be importable from `@/types` in both the route handler and `InterviewRoom.tsx`.
+
+---
+
+### T4: Rewrite `POST /api/interview` route with phase routing; update OpenAPI
 
 - **Type**: backend
 - **Wave**: 2
 - **Files to create or modify**:
-  - `src/lib/ai-client.ts` — new file; exports singleton `aiClient`
+  - `src/app/api/interview/route.ts` — replace single-phase Anthropic logic with three-phase routing
+  - `docs/openapi.yaml` — update `POST /api/interview` description and `decisionState` schema
 - **Implementation notes**:
-  - Read `process.env.AI_PROVIDER` at module load time. Accepted values: `"anthropic"` (also the default when the var is absent) and `"openrouter"`. Any other non-empty value must throw synchronously:
-    ```
-    Error: Unsupported AI_PROVIDER: <value>. Must be "anthropic" or "openrouter"
-    ```
-  - Export a single interface type `AiClientMessages` (or inline the parameter type) — `Array<{ role: 'user' | 'assistant'; content: string }>`.
-  - Export a singleton object `aiClient` with two methods:
-    - `streamCompletion({ systemPrompt: string, messages: AiClientMessages }): Promise<ReadableStream<Uint8Array>>`
-    - `complete({ systemPrompt: string, messages: AiClientMessages }): Promise<string>`
-  - **Anthropic provider** (when `AI_PROVIDER=anthropic` or unset):
-    - If `process.env.ANTHROPIC_API_KEY` is absent, throw at module load:
-      ```
-      Error: ANTHROPIC_API_KEY is required when AI_PROVIDER=anthropic
-      ```
-    - Instantiate `Anthropic` from `@anthropic-ai/sdk` using `{ apiKey: process.env.ANTHROPIC_API_KEY }`.
-    - Model: hardcoded `"claude-sonnet-4-6"` per CLAUDE.md.
-    - `streamCompletion`: call `anthropic.messages.stream({ model, max_tokens: 2048, system: systemPrompt, messages })`. Wrap the async iterator in a `ReadableStream<Uint8Array>` using `TextEncoder` to encode `event.delta.text` for each `content_block_delta` event with `delta.type === 'text_delta'`. Call `controller.close()` after the loop and `controller.error(err)` on exception.
-    - `complete`: call `anthropic.messages.create({ model, max_tokens: 2048, stream: false, system: systemPrompt, messages })`. Return `(response.content[0] as { text: string }).text`.
-  - **OpenRouter provider** (when `AI_PROVIDER=openrouter`):
-    - If `process.env.OPENROUTER_API_KEY` is absent, throw at module load:
-      ```
-      Error: OPENROUTER_API_KEY is required when AI_PROVIDER=openrouter
-      ```
-    - Model: `process.env.OPENROUTER_MODEL ?? "anthropic/claude-sonnet-4-6"`.
-    - Instantiate `OpenAI` from `openai` with:
-      ```typescript
-      {
-        apiKey: process.env.OPENROUTER_API_KEY,
-        baseURL: 'https://openrouter.ai/api/v1',
-        defaultHeaders: {
-          'HTTP-Referer': process.env.NEXT_PUBLIC_APP_URL ?? 'http://localhost:3000',
-          'X-Title': 'AI Interviewer Platform',
+
+  **Imports to change in `route.ts`:**
+  - Add: `import { generateAdaptiveFollowUp } from '@/lib/openrouter';`
+  - Replace: `PostInterviewResponse` → `PostInterviewSuccessResponse` in the import from `@/types`
+
+  **Constant to add at module level:**
+  ```typescript
+  const CLOSING_STATEMENT =
+    "Thank you for your time today. We've covered all the key areas — we'll be in touch with next steps.";
+  ```
+
+  **Phase routing logic** — after the user-answer save block (steps 1–6 in the current code), replace the existing Anthropic-call-and-save block with the three-phase logic described below.
+
+  **Step A — Count OpenRouter turns from `existingTurns`:**
+  ```typescript
+  const openrouterCount = existingTurns.filter(
+    (t) => t.speaker === 'AI' && t.source === 'OPENROUTER'
+  ).length;
+  ```
+  `existingTurns` is fetched before saving the user answer. This count is correct because OpenRouter turns are only added in prior requests, never in the current request's user-save step.
+
+  **Step B — Add `source: 'ANTHROPIC'` to initial AI question save:**
+  The existing transaction that saves the first-turn initial AI question (the `!hasAiTurns` branch) must set `source: 'ANTHROPIC'` on the turn create:
+  ```typescript
+  prisma.turn.create({
+    data: {
+      sessionId,
+      speaker: 'AI',
+      content: currentQuestion,
+      source: 'ANTHROPIC',
+      decisionState: Prisma.JsonNull,
+    },
+  }),
+  ```
+
+  **Step C — `fetchFullTranscript` helper:**
+  Define an inner async function used before each OpenRouter call. It re-fetches after the user answer has been saved, ensuring the latest user turn is included:
+  ```typescript
+  async function fetchFullTranscript() {
+    const allTurns = await prisma.turn.findMany({
+      where: { sessionId },
+      orderBy: { createdAt: 'asc' },
+    });
+    return allTurns.map((t) => ({
+      speaker: t.speaker as string,
+      content: t.content,
+    }));
+  }
+  ```
+
+  **Phase: complete** (`openrouterCount >= 2`) — save closing turn and mark `COMPLETED` in a single `$transaction`; return `isComplete: true`:
+  ```typescript
+  if (openrouterCount >= 2) {
+    await prisma.$transaction([
+      prisma.turn.create({
+        data: {
+          sessionId,
+          speaker: 'AI',
+          content: CLOSING_STATEMENT,
+          source: 'ANTHROPIC',
+          decisionState: Prisma.JsonNull,
         },
-      }
-      ```
-    - `streamCompletion`: call `openai.chat.completions.create({ model, stream: true, messages: [{ role: 'system', content: systemPrompt }, ...messages] })`. Wrap the async iterable in a `ReadableStream<Uint8Array>`, encoding `chunk.choices[0]?.delta?.content ?? ''` for each chunk. Skip empty strings. Call `controller.close()` and `controller.error(err)` appropriately.
-    - `complete`: call `openai.chat.completions.create({ model, stream: false, messages: [{ role: 'system', content: systemPrompt }, ...messages] })`. Return `response.choices[0].message.content ?? ''`.
-  - Use the singleton pattern from `src/lib/prisma.ts` as the model if needed, but since `ai-client.ts` only runs server-side (never in the browser), a plain module-level singleton (not stored on `globalThis`) is sufficient.
-  - All errors thrown at module initialisation are intentional — they fail Next.js startup loudly.
+      }),
+      prisma.session.update({
+        where: { id: sessionId },
+        data: { status: 'COMPLETED', endedAt: new Date() },
+      }),
+    ]);
+    return NextResponse.json<PostInterviewSuccessResponse>({
+      nextQuestion: CLOSING_STATEMENT,
+      isComplete: true,
+      decisionState: null,
+    });
+  }
+  ```
+
+  **Phase: openrouter-followup-2** (`openrouterCount === 1`) — attempt follow-up 2; fall through to complete on failure:
+  ```typescript
+  if (openrouterCount === 1) {
+    let followUp2: string | null = null;
+    try {
+      const transcript = await fetchFullTranscript();
+      followUp2 = await generateAdaptiveFollowUp(transcript, 2);
+    } catch {
+      followUp2 = null; // graceful degradation on network/API error
+    }
+    if (followUp2 && followUp2.trim()) {
+      await prisma.turn.create({
+        data: { sessionId, speaker: 'AI', content: followUp2.trim(), source: 'OPENROUTER' },
+      });
+      return NextResponse.json<PostInterviewSuccessResponse>({
+        nextQuestion: followUp2.trim(),
+        isComplete: false,
+        decisionState: null,
+      });
+    }
+    // Follow-up 2 failed — complete the interview
+    await prisma.$transaction([
+      prisma.turn.create({
+        data: {
+          sessionId,
+          speaker: 'AI',
+          content: CLOSING_STATEMENT,
+          source: 'ANTHROPIC',
+          decisionState: Prisma.JsonNull,
+        },
+      }),
+      prisma.session.update({
+        where: { id: sessionId },
+        data: { status: 'COMPLETED', endedAt: new Date() },
+      }),
+    ]);
+    return NextResponse.json<PostInterviewSuccessResponse>({
+      nextQuestion: CLOSING_STATEMENT,
+      isComplete: true,
+      decisionState: null,
+    });
+  }
+  ```
+
+  **Phase: main-interview** (`openrouterCount === 0`) — call Anthropic as today; then gate on `claudeResponse.isComplete`:
+
+  Keep the `buildInterviewSystemPrompt` + `callClaudeForNextQuestion` calls and the same try/catch that returns `500 { error: 'AI service unavailable. Please try again.' }` on Anthropic failure.
+
+  After `callClaudeForNextQuestion` succeeds:
+
+  - **If `claudeResponse.isComplete === false`** — save Anthropic turn with `source: 'ANTHROPIC'` and return normally:
+    ```typescript
+    await prisma.turn.create({
+      data: {
+        sessionId,
+        speaker: 'AI',
+        content: claudeResponse.question,
+        source: 'ANTHROPIC',
+        decisionState: claudeResponse.decisionState as object,
+      },
+    });
+    return NextResponse.json<PostInterviewSuccessResponse>({
+      nextQuestion: claudeResponse.question,
+      isComplete: false,
+      decisionState: claudeResponse.decisionState,
+    });
+    ```
+
+  - **If `claudeResponse.isComplete === true`** — attempt follow-up 1:
+    ```typescript
+    let followUp1: string | null = null;
+    try {
+      const transcript = await fetchFullTranscript();
+      followUp1 = await generateAdaptiveFollowUp(transcript, 1);
+    } catch {
+      followUp1 = null;
+    }
+    if (followUp1 && followUp1.trim()) {
+      // Do NOT save Anthropic's closing turn; do NOT mark session COMPLETED
+      await prisma.turn.create({
+        data: { sessionId, speaker: 'AI', content: followUp1.trim(), source: 'OPENROUTER' },
+      });
+      return NextResponse.json<PostInterviewSuccessResponse>({
+        nextQuestion: followUp1.trim(),
+        isComplete: false,
+        decisionState: null,
+      });
+    }
+    // Follow-up 1 failed — fall through: use Anthropic closing and complete
+    await prisma.$transaction([
+      prisma.turn.create({
+        data: {
+          sessionId,
+          speaker: 'AI',
+          content: claudeResponse.question,
+          source: 'ANTHROPIC',
+          decisionState: claudeResponse.decisionState as object,
+        },
+      }),
+      prisma.session.update({
+        where: { id: sessionId },
+        data: { status: 'COMPLETED', endedAt: new Date() },
+      }),
+    ]);
+    return NextResponse.json<PostInterviewSuccessResponse>({
+      nextQuestion: claudeResponse.question,
+      isComplete: true,
+      decisionState: claudeResponse.decisionState,
+    });
+    ```
+
+  **`Prisma.JsonNull` usage**: Use `decisionState: Prisma.JsonNull` for turns that store no decision state (OpenRouter turns, closing-statement turns). Use `claudeResponse.decisionState as object` only for Anthropic-generated turns where the `decisionState` object is populated. `Prisma.JsonNull` stores SQL `NULL` in the JSON column; JavaScript `null` would be treated differently by Prisma and stored as the JSON string `"null"`.
+
+  **OpenAPI changes in `docs/openapi.yaml`:**
+
+  Update the `description` field for `POST /api/interview` to document three-phase behaviour: the Anthropic main interview drives the primary Q&A; after Anthropic signals internal completion, up to 2 additional OpenRouter-powered adaptive follow-up questions are injected (one per request) before `isComplete: true` is returned; if `OPENROUTER_API_KEY` is absent or OpenRouter fails, the interview completes gracefully without follow-ups.
+
+  Update the `200` response `decisionState` schema from a required plain object to a `oneOf` that allows `null`:
+  ```yaml
+  decisionState:
+    oneOf:
+      - type: object
+        required: [detectedSkills, coveredTopics, remainingGaps, questionRationale]
+        properties:
+          detectedSkills:
+            type: array
+            items: { type: string }
+          coveredTopics:
+            type: array
+            items: { type: string }
+          remainingGaps:
+            type: array
+            items: { type: string }
+          questionRationale:
+            type: string
+      - type: 'null'
+  ```
+
+  Add an `openrouterFollowUp` example to the existing `200` `examples` block:
+  ```yaml
+  openrouterFollowUp:
+    summary: OpenRouter adaptive follow-up question (decisionState is null)
+    value:
+      nextQuestion: "You mentioned struggling with async race conditions — can you walk me through the debugging approach you took?"
+      isComplete: false
+      decisionState: null
+  ```
+
 - **Testing**:
-  - Unit: create `src/__tests__/ai-client.test.ts`. Use `jest.unstable_mockModule` to mock `@anthropic-ai/sdk` and `openai`. Test:
-    1. With `AI_PROVIDER=anthropic` and `ANTHROPIC_API_KEY` set: module initialises without error.
-    2. With `AI_PROVIDER=anthropic` and `ANTHROPIC_API_KEY` absent: module throws `ANTHROPIC_API_KEY is required...`.
-    3. With `AI_PROVIDER=openrouter` and `OPENROUTER_API_KEY` set: module initialises without error.
-    4. With `AI_PROVIDER=openrouter` and `OPENROUTER_API_KEY` absent: module throws `OPENROUTER_API_KEY is required...`.
-    5. With `AI_PROVIDER=gemini`: module throws `Unsupported AI_PROVIDER: gemini...`.
-    6. `streamCompletion` returns a `ReadableStream` (verify instanceof or duck-type check).
-    7. `complete` returns a string.
-  - Note: because `ai-client.ts` reads env vars at module load, each test case that changes the provider must use dynamic import after setting the env var, and must isolate module state via `jest.resetModules()`.
-  - Integration: none in automated tests — real API calls are manual only.
-  - Manual: set `AI_PROVIDER=anthropic` with a valid key, start the dev server, and confirm it starts. Repeat with `AI_PROVIDER=openrouter`. Confirm a missing key prevents startup.
+  - Unit: write `src/__tests__/interview-route-phase.test.ts`. Mock `@/lib/prisma`, `@/lib/anthropic` (`callClaudeForNextQuestion`), and `@/lib/openrouter` (`generateAdaptiveFollowUp`) using `jest.unstable_mockModule`. Cover these seven branches: (1) `openrouterCount >= 2` → closing statement, `isComplete: true`, session marked COMPLETED in transaction; (2) `openrouterCount === 1` + OpenRouter success → follow-up question, `isComplete: false`, OPENROUTER turn saved; (3) `openrouterCount === 1` + OpenRouter returns `null` → fall through to complete; (4) `openrouterCount === 1` + OpenRouter throws → fall through to complete; (5) `openrouterCount === 0` + Anthropic `isComplete: false` → Anthropic question returned, ANTHROPIC turn saved; (6) `openrouterCount === 0` + Anthropic `isComplete: true` + OpenRouter success → follow-up 1 returned, `isComplete: false`, OPENROUTER turn saved, session NOT marked COMPLETED; (7) `openrouterCount === 0` + Anthropic `isComplete: true` + OpenRouter failure → Anthropic closing returned, `isComplete: true`, session marked COMPLETED.
+  - Integration: run `npx tsc --noEmit` after implementation to confirm no type errors.
+  - Manual: start the dev server with a valid `ANTHROPIC_API_KEY` and `OPENROUTER_API_KEY`. Run a full interview. After Anthropic signals completion, verify two additional questions appear before the completion screen. Inspect the `turns` table and confirm follow-up turns have `source = 'OPENROUTER'`. Verify the session stays `IN_PROGRESS` during follow-ups and becomes `COMPLETED` only after the static closing statement. Repeat with `OPENROUTER_API_KEY` unset and confirm the interview completes normally after Anthropic's closing statement.
 
 ---
 
-### T4: Rewrite `src/app/api/interview/route.ts`; rewrite `src/__tests__/interview-route.test.ts`
-
-- **Type**: backend
-- **Wave**: 3
-- **Files to create or modify**:
-  - `src/app/api/interview/route.ts` — full rewrite; replaces placeholder logic with real AI streaming
-  - `src/__tests__/interview-route.test.ts` — full rewrite; the existing tests are invalidated by the new response format
-- **Implementation notes**:
-
-  **Route (`src/app/api/interview/route.ts`)**:
-  - Remove the `PLACEHOLDER_QUESTIONS` and `NEXT_QUESTION` constants, the `PostInterviewResponse` import, and the `$transaction` call.
-  - Import `aiClient` from `@/lib/ai-client` and `buildInterviewSystemPrompt` from `@/lib/anthropic`.
-  - The function signature changes to `export async function POST(request: NextRequest): Promise<Response>` — return a plain `Response`, not `NextResponse`, because streaming requires constructing the response manually.
-  - **Validation** (unchanged logic): return `NextResponse.json({ error: 'sessionId, userAnswer, and turnNumber are required' }, { status: 400 })` for invalid inputs.
-  - **Session and job loading**: use `prisma.session.findUnique({ where: { id: sessionId }, include: { job: true } })`. Return 404 if null. Return 409 if `session.status !== 'IN_PROGRESS'`.
-  - **Persist user turn** (before calling AI): `await prisma.turn.create({ data: { sessionId, speaker: 'USER', content: userAnswer } })`.
-  - **Load conversation history**: `await prisma.turn.findMany({ where: { sessionId }, orderBy: { createdAt: 'asc' } })`. Map to `{ role: turn.speaker === 'AI' ? 'assistant' : 'user', content: turn.content }`.
-  - **Call AI**: wrap in try/catch around `await aiClient.streamCompletion(...)`. If it throws, return `NextResponse.json({ error: 'AI provider error' }, { status: 502 })`.
-  - **Stream construction**: create a `ReadableStream<Uint8Array>` whose `start(controller)` callback does the following:
-    1. Obtain a `ReadableStreamDefaultReader` from the AI stream.
-    2. Decode each chunk using `TextDecoder` (with `{ stream: true }` option).
-    3. Append each decoded chunk to an `accumulated` string.
-    4. Strip the `[INTERVIEW_COMPLETE]` sentinel from each chunk before forwarding: `const forwarded = chunk.replace('[INTERVIEW_COMPLETE]', ''); if (forwarded) controller.enqueue(encoder.encode(forwarded));`
-    5. On read completion, call `controller.close()`.
-    6. In the catch block, call `controller.error(err)`.
-    7. After `controller.close()` (using a `finally` block or code after the loop), perform DB writes:
-       - `const cleanContent = accumulated.replace('[INTERVIEW_COMPLETE]', '').trim();`
-       - `const isComplete = accumulated.includes('[INTERVIEW_COMPLETE]');`
-       - `await prisma.turn.create({ data: { sessionId, speaker: 'AI', content: cleanContent } });`
-       - If `isComplete`: `await prisma.session.update({ where: { id: sessionId }, data: { status: 'COMPLETED', endedAt: new Date() } });`
-    8. Wrap all DB writes in a try/catch and log errors (they cannot propagate to the client since the response has already started streaming).
-  - **Return value**: `return new Response(outputStream, { status: 200, headers: { 'Content-Type': 'text/plain; charset=utf-8' } })`.
-  - Handle unexpected outer errors with `return NextResponse.json({ error: 'Internal server error' }, { status: 500 })`.
-
-  **Test file rewrite (`src/__tests__/interview-route.test.ts`)**:
-  - Mock both `@/lib/prisma` AND `@/lib/ai-client` using `jest.unstable_mockModule`.
-  - For `@/lib/ai-client`, mock `aiClient.streamCompletion` to return a `ReadableStream<Uint8Array>` that emits a configurable text string.
-  - Helper: create a `makeTextStream(text: string): ReadableStream<Uint8Array>` that synchronously enqueues `encoder.encode(text)` and closes.
-  - The mocked Prisma must now include `session.findUnique` (returning a session with `job` relation), `turn.create`, `turn.findMany`, and `session.update`.
-  - Test cases to cover:
-    1. Returns 400 for all invalid input combinations (sessionId missing/empty, userAnswer missing/empty, turnNumber missing/non-integer/negative) — same as before.
-    2. Returns 404 when session not found.
-    3. Returns 409 when session status is COMPLETED or ABANDONED.
-    4. Returns 502 when `aiClient.streamCompletion` throws.
-    5. Returns 200 with `Content-Type: text/plain; charset=utf-8` on success.
-    6. On success without sentinel: reads stream body as text, verifies it matches the mocked AI text; verifies `turn.create` is called twice (once for USER, once for AI); verifies `session.update` is NOT called.
-    7. On success with sentinel (`[INTERVIEW_COMPLETE]` appended to stream text): verifies sentinel is absent in the response body; verifies `session.update` is called with `status: 'COMPLETED'`.
-  - Note: reading the streaming response body in tests requires `await res.text()` or accumulating the reader — use `await res.text()` for simplicity.
-
-- **Testing**:
-  - Unit: the rewritten `src/__tests__/interview-route.test.ts` covers all cases above.
-  - Integration: with a running DB and valid AI key, POST to `/api/interview` with a valid `sessionId` and `userAnswer`; verify the response streams text and that Turn rows appear in the DB.
-  - Manual: open the interview UI, record an answer, observe the "Thinking…" phase, and verify the next question appears after the stream ends.
-
----
-
-### T5: Create `src/app/api/evaluate/route.ts` and `src/__tests__/evaluate-route.test.ts`
-
-- **Type**: backend
-- **Wave**: 3
-- **Files to create or modify**:
-  - `src/app/api/evaluate/route.ts` — new file
-  - `src/__tests__/evaluate-route.test.ts` — new file
-- **Implementation notes**:
-
-  **Route (`src/app/api/evaluate/route.ts`)**:
-  - Import `aiClient` from `@/lib/ai-client`, `buildEvaluationPrompt` from `@/lib/anthropic`, and `prisma` from `@/lib/prisma`.
-  - Accept `POST` with body `{ sessionId: string }`.
-  - **Validation**: if `sessionId` is missing or not a non-empty string, return `NextResponse.json({ error: 'sessionId is required' }, { status: 400 })`.
-  - **Session load**: `prisma.session.findUnique({ where: { id: sessionId } })`. Return 404 if null.
-  - **ABANDONED check**: if `session.status === 'ABANDONED'`, return 409 `{ error: 'Session is not in progress or completed' }`.
-  - **Duplicate evaluation check**: `prisma.evaluation.findUnique({ where: { sessionId } })`. If it exists, return 409 `{ error: 'Evaluation already exists' }`.
-  - **Load turns**: `prisma.turn.findMany({ where: { sessionId }, orderBy: { createdAt: 'asc' } })`.
-  - **Build prompt and call AI**: `const rawResponse = await aiClient.complete({ systemPrompt: '', messages: [{ role: 'user', content: buildEvaluationPrompt(turns) }] })`. Note: `buildEvaluationPrompt` returns a user-turn prompt (the entire evaluation request), so pass it as the only user message with an empty system prompt.
-  - **Strip markdown fences**: apply the regex `rawResponse.replace(/^```(?:json)?\n?/i, '').replace(/\n?```$/i, '').trim()` before parsing.
-  - **Parse JSON**: wrap in try/catch. If `JSON.parse` throws, return `NextResponse.json({ error: 'AI returned an unparseable evaluation' }, { status: 502 })`.
-  - **Normalise fields**:
-    - `strengths`: `Array.isArray(parsed.strengths) ? parsed.strengths : []`
-    - `concerns`: `Array.isArray(parsed.concerns) ? parsed.concerns : []`
-    - `overall_score`: parse as number. Apply `Math.round` if float. Clamp: `Math.max(1, Math.min(10, rounded))`.
-  - **Persist Evaluation**: `prisma.evaluation.create({ data: { sessionId, strengths: strengths, concerns: concerns, score: score } })`.
-  - **Update session** if `endedAt` is null: `prisma.session.update({ where: { id: sessionId }, data: { status: 'COMPLETED', endedAt: new Date() } })`.
-  - Return `NextResponse.json({ id: evaluation.id, strengths, concerns, score }, { status: 201 })`.
-  - Wrap the entire handler body in try/catch; return 500 for unexpected errors.
-
-  **Test file (`src/__tests__/evaluate-route.test.ts`)**:
-  - Mock `@/lib/prisma` and `@/lib/ai-client` using `jest.unstable_mockModule`.
-  - Mock `aiClient.complete` to return a configurable JSON string.
-  - Test cases:
-    1. Returns 400 when `sessionId` is missing or empty.
-    2. Returns 404 when session is not found.
-    3. Returns 409 `Session is not in progress or completed` when `session.status === 'ABANDONED'`.
-    4. Returns 409 `Evaluation already exists` when an evaluation row already exists.
-    5. Returns 502 when `aiClient.complete` returns unparseable JSON.
-    6. Returns 201 with `{ id, strengths, concerns, score }` on success with a valid JSON response.
-    7. Strips markdown fences: mock `aiClient.complete` to return `` ```json\n{"strengths":[],"concerns":[],"overall_score":7}\n``` ``; verify it still parses and returns 201.
-    8. Normalises `overall_score`: mock returning `7.8` → score should be `8`; mock returning `15` → score should be `10`; mock returning `0` → score should be `1`.
-    9. Uses empty arrays for missing `strengths` or `concerns`.
-    10. Returns 500 on unexpected Prisma error.
-
-- **Testing**:
-  - Unit: `src/__tests__/evaluate-route.test.ts` covers all cases above.
-  - Integration: after completing an interview session (with Turn rows in the DB), POST `{ sessionId }` to `/api/evaluate` and verify a 201 response with a valid evaluation object; verify the `evaluations` table row and the session's `endedAt` and `status` fields.
-  - Manual: complete a full interview in the browser, then trigger evaluation via the UI or curl; verify the evaluation renders on the results page.
-
----
-
-### T6: Update `InterviewRoom.tsx` and remove `PostInterviewResponse` from `src/types/index.ts`
+### T5: Update `InterviewRoom.tsx` type import
 
 - **Type**: frontend
-- **Wave**: 4
+- **Wave**: 2
 - **Files to create or modify**:
-  - `src/components/InterviewRoom.tsx` — update `submitTurn` to consume the streaming response body
-  - `src/types/index.ts` — remove the `PostInterviewResponse` interface
+  - `src/components/InterviewRoom.tsx` — replace `PostInterviewResponse` import and type assertion with `PostInterviewSuccessResponse`
 - **Implementation notes**:
+  The existing `InterviewRoom.tsx` already sends `currentQuestion` (not `turnNumber`) in the request body and already calls `res.json()` to parse the response — those fixes are already in place. The only changes required are:
 
-  **`src/types/index.ts`**:
-  - Delete the `PostInterviewResponse` interface (lines defining `nextQuestion: string` and `isComplete: boolean`). No replacement type is needed.
+  1. In the import block, replace `PostInterviewResponse` with `PostInterviewSuccessResponse`:
+     ```typescript
+     import type {
+       Job,
+       InterviewRoomState,
+       InterviewRoomAction,
+       PostSessionResponse,
+       PostInterviewSuccessResponse,
+     } from '@/types';
+     ```
 
-  **`src/components/InterviewRoom.tsx`**:
-  - In the `import` statement at the top, remove `PostInterviewResponse` from the named import list of `@/types`. The other types (`Job`, `InterviewRoomState`, `InterviewRoomAction`, `PostSessionResponse`) remain.
-  - Locate the `submitTurn` async function inside the `useEffect` for the `processing` phase. Replace the block that calls `res.json()` with the streaming read logic:
-    ```typescript
-    // After the existing !res.ok error handling block:
-    if (!res.body) {
-      dispatch({ type: 'API_ERROR', message: 'Failed to read AI response.' });
-      return;
-    }
-    let accumulated = '';
-    try {
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        accumulated += decoder.decode(value, { stream: true });
-        if (cancelled) return;
-      }
-    } catch {
-      if (!cancelled) {
-        dispatch({ type: 'API_ERROR', message: 'Failed to read AI response.' });
-      }
-      return;
-    }
-    const SENTINEL = '[INTERVIEW_COMPLETE]';
-    const isComplete = accumulated.includes(SENTINEL);
-    const nextQuestion = accumulated.replace(SENTINEL, '').trim();
-    dispatch({ type: 'TURN_SAVED', nextQuestion, isComplete });
-    speakQuestion(nextQuestion);
-    ```
-  - The `cancelled` variable is already in scope from the outer `useEffect` closure — the check after each read prevents stale state updates.
-  - Do not change any rendered JSX, other action handlers, or the reducer logic.
-  - The `RETRY_TURN` action dispatches back to `processing` phase, which re-runs `submitTurn`. This is unchanged behaviour and still works correctly.
+  2. In `submitTurn`, change the type assertion on `res.json()`:
+     ```typescript
+     const data = (await res.json()) as PostInterviewSuccessResponse;
+     ```
 
-  **`src/__tests__/InterviewRoom.test.tsx`**:
-  - Update any test that mocks `fetch` for `/api/interview` to return a streaming response instead of a JSON response. Use a `Response` with a `ReadableStream` body containing the question text as UTF-8.
-  - Verify that after the stream resolves, the component transitions out of the `processing` phase and displays the next question.
-  - Verify that when the stream body contains `[INTERVIEW_COMPLETE]`, the component moves to the `complete` phase.
+  No logic changes are needed. The `data.decisionState ?? null` null-coalescing already present in the `TURN_SAVED` dispatch correctly handles `decisionState: null` from OpenRouter responses.
 
 - **Testing**:
-  - Unit: update `src/__tests__/InterviewRoom.test.tsx` as described.
-  - Integration: none (browser-only streaming API).
-  - Manual: run the full interview flow in Chrome; verify each answer submission causes the next question to appear after streaming completes; verify the interview ends when the AI appends `[INTERVIEW_COMPLETE]`.
-
----
-
-### T7: Update `docs/openapi.yaml`
-
-- **Type**: backend
-- **Wave**: 4
-- **Files to create or modify**:
-  - `docs/openapi.yaml` — update `/api/interview` 200 response; add `/api/evaluate` endpoint
-- **Implementation notes**:
-
-  **Update `/api/interview` 200 response**:
-  - Replace the existing `application/json` schema for the 200 response (which had `nextQuestion` and `isComplete` properties) with:
-    ```yaml
-    '200':
-      description: |
-        AI next question streamed as plain UTF-8 text. The [INTERVIEW_COMPLETE]
-        sentinel is stripped before the stream is forwarded. When the session
-        has ended the server updates status to COMPLETED server-side.
-      headers:
-        Transfer-Encoding:
-          schema:
-            type: string
-            example: chunked
-      content:
-        text/plain:
-          schema:
-            type: string
-            example: "Can you walk me through a specific technical challenge you faced recently?"
-    ```
-  - Add the `502` response entry to `/api/interview` alongside the existing 400/404/409/500:
-    ```yaml
-    '502':
-      description: AI provider returned an error or stream failed.
-      content:
-        application/json:
-          schema:
-            type: object
-            required: [error]
-            properties:
-              error:
-                type: string
-                example: "AI provider error"
-    ```
-  - Update the `description` of `/api/interview` to reflect the new real-AI streaming behaviour (remove references to hardcoded/placeholder questions).
-
-  **Add `/api/evaluate` endpoint**:
-  - Add a new path entry `POST /api/evaluate` with:
-    - `operationId: evaluateSession`
-    - `tags: [evaluate]`
-    - Request body: `{ sessionId: string }` (required)
-    - Response `201`: `{ id: string, strengths: string[], concerns: string[], score: integer }` — include a clear `description` and example values
-    - Response `400`: `{ error: "sessionId is required" }`
-    - Response `404`: `{ error: "Session not found" }`
-    - Response `409` (two examples):
-      - `{ error: "Session is not in progress or completed" }` — when status is ABANDONED
-      - `{ error: "Evaluation already exists" }` — when an evaluation row already exists
-    - Response `502`: `{ error: "AI returned an unparseable evaluation" }`
-    - Response `500`: `{ error: "Internal server error" }`
-
-- **Testing**:
-  - Unit: none (YAML is documentation).
-  - Integration: validate the YAML is well-formed by running `npx js-yaml docs/openapi.yaml` or similar; if no YAML validator is installed, visually inspect indentation.
-  - Manual: open the YAML file, verify the `/api/interview` 200 response no longer references `nextQuestion`/`isComplete`, the `502` entry is present, and the `/api/evaluate` entry covers all six response codes.
+  - Unit: update `src/__tests__/InterviewRoom.test.tsx` — any `fetch` mock that returns a `PostInterviewResponse`-shaped object should be updated so that `decisionState` can be `null`. Verify that a mocked response with `decisionState: null` causes the `TURN_SAVED` dispatch to receive `decisionState: null` without throwing a type error or runtime exception.
+  - Manual: run `npx tsc --noEmit` to confirm no errors. Open the interview room in a browser and verify the existing turn-submission flow is visually unchanged.
 
 ---
 
 ## Data migrations
 
-No Prisma schema changes are required. All necessary models (`Session`, `Turn`, `Evaluation`) and their fields (`strengths Json`, `concerns Json`, `score Int`, `endedAt DateTime?`) already exist. Do not run any migration commands.
+Add the following to `prisma/schema.prisma` before the `Speaker` enum:
+
+```prisma
+enum TurnSource {
+  ANTHROPIC
+  OPENROUTER
+}
+```
+
+Add the following field to the `Turn` model after `content` and before `decisionState`:
+
+```prisma
+source TurnSource?
+```
+
+The DB column name is `source` (no `@map` needed; the field name is already snake_case).
+
+Migration command:
+```bash
+npx prisma migrate dev --name add_source_to_turns
+npx prisma generate
+```
+
+Existing `Turn` rows receive `NULL` for `source`. No backfill is required.
 
 ## API documentation updates
 
-- `POST /api/interview` — updated in T7. The 200 response changes from `application/json` with `{ nextQuestion, isComplete }` to `text/plain; charset=utf-8` with a streaming body. A new `502` response is added.
-- `POST /api/evaluate` — new endpoint, documented in T7. All six response codes (201/400/404/409/502/500) must be present in `docs/openapi.yaml`.
+`POST /api/interview` in `docs/openapi.yaml` (updated by T4 backend implementer):
+- `description`: describe the three-phase behaviour — main interview via Anthropic, then up to 2 OpenRouter follow-ups, then static closing with `isComplete: true`.
+- `200` response `decisionState` schema: change from a required object to `oneOf` allowing `null`.
+- `200` response `examples`: add `openrouterFollowUp` example showing `decisionState: null`.
+
+No new endpoints are introduced by this feature.
 
 ## Cross-cutting concerns
 
-- **`aiClient` singleton** (`src/lib/ai-client.ts`): shared by T4 (`/api/interview`) and T5 (`/api/evaluate`). Must be fully implemented in T3 before T4 and T5 begin.
-- **Prompt builders** (`src/lib/anthropic.ts`): `buildInterviewSystemPrompt` used by T4; `buildEvaluationPrompt` used by T5. Both must be implemented in T2 before T4 and T5 begin.
-- **`[INTERVIEW_COMPLETE]` sentinel constant**: defined as a string literal `'[INTERVIEW_COMPLETE]'` in both the interview route (T4) and `InterviewRoom.tsx` (T6). It must match exactly. Consider extracting it to a shared constant in `src/lib/anthropic.ts` (e.g. `export const INTERVIEW_COMPLETE_SENTINEL = '[INTERVIEW_COMPLETE]';`) to prevent typo drift. T4 and T6 implementers should both import this constant.
-- **`PostInterviewResponse` removal**: T6 removes the type from `src/types/index.ts` and its import from `InterviewRoom.tsx`. T4 removes its import from `src/app/api/interview/route.ts` as part of the route rewrite. Implementers must coordinate — T4 should already drop this import; T6 cleans up the type definition itself.
-- **npm packages**: T1 installs `@anthropic-ai/sdk` and `openai`. T3 (and indirectly T4/T5 via T3) depends on these packages. T1 must be fully merged (i.e. `package.json` and `package-lock.json` committed) before T3 begins coding.
+- **`generateAdaptiveFollowUp` is server-only.** Verify `src/lib/openrouter.ts` has no `'use client'` directive and is not re-exported from any client-facing barrel.
+- **`Prisma.JsonNull` vs JavaScript `null` for `decisionState`.** The route must use `Prisma.JsonNull` (imported from `@/generated/prisma/client`) when saving turns without a decisionState. Using plain JavaScript `null` would cause Prisma to emit the JSON string `"null"` rather than SQL `NULL`.
+- **`TurnSource` string literals vs enum import.** After running `npx prisma generate`, the generated client accepts the string literals `'ANTHROPIC'` and `'OPENROUTER'` directly in `turn.create({ data: { source: 'ANTHROPIC' } })` due to TypeScript's enum assignability. An explicit `import { TurnSource } from '@/generated/prisma/client'` is not required in the route handler, but is acceptable if the implementer prefers it.
+- **`PostInterviewSuccessResponse` is the authoritative response type for `POST /api/interview`.** Both T4 (route) and T5 (component) must use this type. The existing `PostInterviewResponse` interface in `src/types/index.ts` is kept unchanged to avoid breaking test snapshots that reference it; it is simply no longer used by the route.

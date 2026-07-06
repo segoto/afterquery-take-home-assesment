@@ -1,8 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { Prisma } from '@/generated/prisma/client';
 import { prisma } from '@/lib/prisma';
-import { buildInterviewSystemPrompt, callClaudeForNextQuestion } from '@/lib/anthropic';
-import type { PostInterviewResponse, ApiErrorResponse, ClaudeInterviewResponse } from '@/types';
+import { getStaticQuestionBank } from '@/lib/question-bank';
+import { buildBankSelectionPrompt, callModelForBankSelection } from '@/lib/bank-selection';
+import type { PostInterviewResponse, ApiErrorResponse, BankSelectionResponse } from '@/types';
+
+const CLOSING_STATEMENT =
+  "Thank you for your time today. We've covered all the key areas — we'll be in touch with next steps.";
 
 export async function POST(request: NextRequest): Promise<Response> {
   try {
@@ -32,7 +36,7 @@ export async function POST(request: NextRequest): Promise<Response> {
 
     const session = await prisma.session.findUnique({
       where: { id: sessionId },
-      include: { job: { include: { skills: true } } },
+      include: { job: true },
     });
 
     if (!session) {
@@ -56,6 +60,26 @@ export async function POST(request: NextRequest): Promise<Response> {
 
     const hasAiTurns = existingTurns.some((t) => t.speaker === 'AI');
 
+    // Load the static question bank for this job
+    const fullBank = getStaticQuestionBank(session.jobId);
+
+    // Collect IDs of bank questions already asked (from AI turn decisionState)
+    const usedQuestionIds = new Set<string>();
+    for (const turn of existingTurns) {
+      if (turn.speaker === 'AI' && turn.decisionState !== null) {
+        const ds = turn.decisionState as Record<string, unknown>;
+        if (typeof ds.selectedQuestionId === 'string' && ds.selectedQuestionId !== '') {
+          usedQuestionIds.add(ds.selectedQuestionId);
+        }
+      }
+    }
+
+    // Filter to questions not yet asked
+    const remainingQuestions = fullBank.filter((q) => !usedQuestionIds.has(q.id));
+
+    // Count AI turns already saved (includes the initial hardcoded question turn)
+    const aiTurnCount = existingTurns.filter((t) => t.speaker === 'AI').length;
+
     // Build conversation history from existing turns
     const conversationHistory: Array<{ role: 'user' | 'assistant'; content: string }> =
       existingTurns.map((turn) => ({
@@ -76,7 +100,7 @@ export async function POST(request: NextRequest): Promise<Response> {
     const userAnswerAlreadySaved =
       lastTurn?.speaker === 'USER' && lastTurn?.content === userAnswer;
 
-    // Save user answer (pre-Claude) — skip if already saved on a prior retry
+    // Save user answer (pre-model) — skip if already saved on a prior retry
     if (!userAnswerAlreadySaved) {
       if (!hasAiTurns) {
         // First turn: also save the initial AI question before the user answer
@@ -86,6 +110,7 @@ export async function POST(request: NextRequest): Promise<Response> {
               sessionId,
               speaker: 'AI',
               content: currentQuestion,
+              source: 'ANTHROPIC',
               decisionState: Prisma.JsonNull,
             },
           }),
@@ -102,33 +127,62 @@ export async function POST(request: NextRequest): Promise<Response> {
       }
     }
 
-    // Build the system prompt and call Claude
-    const systemPrompt = buildInterviewSystemPrompt(
-      session.job.title,
-      session.job.description,
-      session.job.skills
-    );
+    let nextQuestion: string;
+    let isComplete: boolean;
+    let decisionStateData: BankSelectionResponse;
 
-    let claudeResponse: ClaudeInterviewResponse;
-    try {
-      claudeResponse = await callClaudeForNextQuestion(systemPrompt, conversationHistory);
-    } catch {
-      // Do NOT roll back user turn saves — they reflect real candidate answers
-      return NextResponse.json<ApiErrorResponse>(
-        { error: 'AI service unavailable. Please try again.' },
-        { status: 500 }
+    if (remainingQuestions.length === 0 && aiTurnCount >= 6) {
+      // Bank fully exhausted and minimum questions met — close without model call
+      nextQuestion = CLOSING_STATEMENT;
+      isComplete = true;
+      decisionStateData = {
+        selectedQuestionId: null,
+        question: nextQuestion,
+        isComplete: true,
+        detectedSkills: [],
+        coveredTopics: [],
+        remainingGaps: [],
+        questionRationale: 'Bank fully covered. Interview closed.',
+      };
+    } else {
+      // Call the model for bank-based selection
+      const systemPrompt = buildBankSelectionPrompt(
+        session.job.title,
+        session.job.description,
+        remainingQuestions,
+        aiTurnCount,
       );
+      let modelResponse: BankSelectionResponse;
+      try {
+        modelResponse = await callModelForBankSelection(systemPrompt, conversationHistory);
+      } catch {
+        return NextResponse.json<ApiErrorResponse>(
+          { error: 'AI service unavailable. Please try again.' },
+          { status: 500 }
+        );
+      }
+      nextQuestion = modelResponse.question;
+      isComplete = modelResponse.isComplete;
+      decisionStateData = modelResponse;
     }
 
-    // Save Claude's AI turn and optionally mark session as completed
-    if (claudeResponse.isComplete) {
+    const storedDecisionState = {
+      selectedQuestionId: decisionStateData.selectedQuestionId,
+      detectedSkills: decisionStateData.detectedSkills,
+      coveredTopics: decisionStateData.coveredTopics,
+      remainingGaps: decisionStateData.remainingGaps,
+      questionRationale: decisionStateData.questionRationale,
+    };
+
+    if (isComplete) {
       await prisma.$transaction([
         prisma.turn.create({
           data: {
             sessionId,
             speaker: 'AI',
-            content: claudeResponse.question,
-            decisionState: claudeResponse.decisionState as object,
+            content: nextQuestion,
+            source: 'ANTHROPIC',
+            decisionState: storedDecisionState as object,
           },
         }),
         prisma.session.update({
@@ -137,22 +191,21 @@ export async function POST(request: NextRequest): Promise<Response> {
         }),
       ]);
     } else {
-      await prisma.$transaction([
-        prisma.turn.create({
-          data: {
-            sessionId,
-            speaker: 'AI',
-            content: claudeResponse.question,
-            decisionState: claudeResponse.decisionState as object,
-          },
-        }),
-      ]);
+      await prisma.turn.create({
+        data: {
+          sessionId,
+          speaker: 'AI',
+          content: nextQuestion,
+          source: 'ANTHROPIC',
+          decisionState: storedDecisionState as object,
+        },
+      });
     }
 
     return NextResponse.json<PostInterviewResponse>({
-      nextQuestion: claudeResponse.question,
-      isComplete: claudeResponse.isComplete,
-      decisionState: claudeResponse.decisionState,
+      nextQuestion,
+      isComplete,
+      decisionState: storedDecisionState,
     });
   } catch {
     return NextResponse.json<ApiErrorResponse>(
