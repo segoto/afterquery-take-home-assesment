@@ -83,29 +83,20 @@ function makeInterviewResponse(
   nextQuestion = 'Next question',
   isComplete = false
 ): Response {
-  const text = isComplete ? `${nextQuestion}[INTERVIEW_COMPLETE]` : nextQuestion;
-  // Use Node's Buffer (always available) instead of TextEncoder (not in jsdom).
-  // TextDecoder.decode() accepts any BufferSource including Buffer/Uint8Array.
-  const encoded = Buffer.from(text, 'utf8') as unknown as Uint8Array;
-  let readCalled = false;
-  // Duck-typed ReadableStreamDefaultReader — jsdom does not expose ReadableStream
-  // globally, so we build an object that satisfies the interface InterviewRoom uses:
-  // res.body.getReader() → reader; reader.read() → { done, value }
-  const body = {
-    getReader: () => ({
-      read: (): Promise<{ done: boolean; value: Uint8Array | undefined }> => {
-        if (!readCalled) {
-          readCalled = true;
-          return Promise.resolve({ done: false, value: encoded });
-        }
-        return Promise.resolve({ done: true, value: undefined });
-      },
-    }),
-  };
   return {
     ok: true,
     status: 200,
-    body,
+    json: () =>
+      Promise.resolve({
+        nextQuestion,
+        isComplete,
+        decisionState: {
+          detectedSkills: ['TypeScript'],
+          coveredTopics: ['Background'],
+          remainingGaps: ['System Design'],
+          questionRationale: 'Probing system design.',
+        },
+      }),
   } as unknown as Response;
 }
 
@@ -350,21 +341,100 @@ describe('InterviewRoom', () => {
     });
   });
 
-  // ── 10. CallTimer renders "00:00" and has aria-label after session creation ───
+  // ── 11. DecisionPanel renders in awaiting_recording phase ────────────────────
 
-  it('CallTimer renders "00:00" and has aria-label="Elapsed interview time" after session creation', async () => {
+  it('DecisionPanel renders in awaiting_recording phase', async () => {
     const mockFetch = createFetchMock();
     mockFetch.mockResolvedValue(makeSessionResponse());
     global.fetch = mockFetch;
 
-    const { container } = render(<InterviewRoom job={VALID_JOB} />);
+    render(<InterviewRoom job={VALID_JOB} />);
 
     await waitFor(() => {
-      const timerEl = container.querySelector('[aria-label="Elapsed interview time"]');
-      expect(timerEl).toBeInTheDocument();
+      expect(
+        document.querySelector('[aria-label="AI decision panel"]')
+      ).toBeInTheDocument();
+    });
+  });
+
+  // ── 12. DecisionPanel shows loading state in processing phase ─────────────────
+
+  it('DecisionPanel shows loading state in processing phase', async () => {
+    const mockFetch = createFetchMock();
+    mockFetch
+      .mockResolvedValueOnce(makeSessionResponse())
+      .mockImplementationOnce(() => new Promise<Response>(() => {})); // interview fetch never resolves
+    global.fetch = mockFetch;
+
+    render(<InterviewRoom job={VALID_JOB} />);
+
+    // Wait for awaiting_recording phase
+    await waitFor(() => {
+      expect(screen.getByTestId('mock-record-button')).toBeInTheDocument();
     });
 
-    const timerEl = container.querySelector('[aria-label="Elapsed interview time"]');
-    expect(timerEl).toHaveTextContent('00:00');
+    // Click mock button → processing phase → DecisionPanel isLoading=true
+    fireEvent.click(screen.getByTestId('mock-record-button'));
+
+    await waitFor(() => {
+      const decisionPanel = document.querySelector('[aria-label="AI decision panel"]');
+      expect(decisionPanel).not.toBeNull();
+      // Spinner inside DecisionPanel renders role="status"
+      expect(decisionPanel!.querySelector('[role="status"]')).not.toBeNull();
+    });
   });
+
+  // ── 13. DecisionPanel shows decisionState data after TURN_SAVED ───────────────
+
+  it('DecisionPanel shows decisionState data after TURN_SAVED', async () => {
+    const mockFetch = createFetchMock();
+    mockFetch
+      .mockResolvedValueOnce(makeSessionResponse())
+      .mockResolvedValueOnce(makeInterviewResponse('Next question', false));
+    global.fetch = mockFetch;
+
+    render(<InterviewRoom job={VALID_JOB} />);
+
+    // Wait for awaiting_recording phase
+    await waitFor(() => {
+      expect(screen.getByTestId('mock-record-button')).toBeInTheDocument();
+    });
+
+    // Trigger transcript → processing → TURN_SAVED → decisionState populated
+    fireEvent.click(screen.getByTestId('mock-record-button'));
+
+    await waitFor(() => {
+      expect(screen.getByText('Probing system design.')).toBeInTheDocument();
+    });
+  });
+
+  // ── 14. /api/interview request body contains currentQuestion ──────────────────
+
+  it('calls /api/interview with currentQuestion in request body', async () => {
+    const mockFetch = createFetchMock();
+    mockFetch
+      .mockResolvedValueOnce(makeSessionResponse())
+      .mockImplementationOnce(() => new Promise<Response>(() => {})); // interview fetch never resolves
+    global.fetch = mockFetch;
+
+    render(<InterviewRoom job={VALID_JOB} />);
+
+    // Wait for awaiting_recording phase
+    await waitFor(() => {
+      expect(screen.getByTestId('mock-record-button')).toBeInTheDocument();
+    });
+
+    // Trigger turn submission
+    fireEvent.click(screen.getByTestId('mock-record-button'));
+
+    await waitFor(() => {
+      expect(mockFetch).toHaveBeenCalledWith(
+        '/api/interview',
+        expect.objectContaining({
+          body: expect.stringContaining('"currentQuestion"'),
+        })
+      );
+    });
+  });
+
 });

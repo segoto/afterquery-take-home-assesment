@@ -6,9 +6,10 @@ import { Badge } from '@/components/ui';
 
 interface TranscriptViewProps {
   turns: TranscriptTurn[];
+  variant?: 'light' | 'dark'; // default: 'light'
 }
 
-export function TranscriptView({ turns }: TranscriptViewProps) {
+export function TranscriptView({ turns, variant = 'light' }: TranscriptViewProps) {
   const lastTurnRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -20,18 +21,21 @@ export function TranscriptView({ turns }: TranscriptViewProps) {
       {turns.length === 0 ? (
         <p className="text-zinc-400 text-sm">The interview will appear here.</p>
       ) : (
-        turns.map((turn, i) => (
-          <div
-            key={turn.id}
-            ref={i === turns.length - 1 ? lastTurnRef : undefined}
-            className="flex flex-col gap-1"
-          >
-            <Badge variant={turn.speaker === 'AI' ? 'ai' : 'user'}>
-              {turn.speaker === 'AI' ? 'AI Interviewer' : 'You'}
-            </Badge>
-            <p className="text-zinc-900 text-sm">{turn.content}</p>
-          </div>
-        ))
+        turns.map((turn, i) => {
+          const textClass = variant === 'dark' ? 'text-zinc-200 text-sm' : 'text-zinc-900 text-sm';
+          return (
+            <div
+              key={turn.id}
+              ref={i === turns.length - 1 ? lastTurnRef : undefined}
+              className="flex flex-col gap-1"
+            >
+              <Badge variant={turn.speaker === 'AI' ? 'ai' : 'user'}>
+                {turn.speaker === 'AI' ? 'AI Interviewer' : 'You'}
+              </Badge>
+              <p className={textClass}>{turn.content}</p>
+            </div>
+          );
+        })
       )}
     </div>
   );

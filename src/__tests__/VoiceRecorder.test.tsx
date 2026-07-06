@@ -2,13 +2,15 @@
  * @jest-environment jsdom
  */
 import { jest, describe, it, expect, beforeEach, afterEach } from '@jest/globals';
-import { render, screen, fireEvent } from '@testing-library/react';
+import { render, screen, fireEvent, act } from '@testing-library/react';
 import React from 'react';
 
 type WindowWithSpeechRecognition = Window & {
   SpeechRecognition?: unknown;
   webkitSpeechRecognition?: unknown;
 };
+
+let lastRecognitionInstance: MockSpeechRecognition | null = null;
 
 class MockSpeechRecognition {
   continuous = false;
@@ -19,6 +21,12 @@ class MockSpeechRecognition {
   onerror: ((event: SpeechRecognitionErrorEvent) => void) | null = null;
   start = jest.fn();
   stop = jest.fn();
+  abort = jest.fn();
+
+  constructor() {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias
+    lastRecognitionInstance = this;
+  }
 }
 
 // Dynamically import VoiceRecorder after mocks are set up
@@ -32,9 +40,18 @@ const defaultProps = {
   disabled: false,
 };
 
+/** Build a SpeechRecognitionEvent-shaped object for testing onresult handlers. */
+function makeSpeechResultEvent(transcript: string, isFinal: boolean): SpeechRecognitionEvent {
+  const alternative = { transcript, confidence: 1 } as SpeechRecognitionAlternative;
+  const result = Object.assign([alternative], { isFinal, length: 1 }) as unknown as SpeechRecognitionResult;
+  const results = Object.assign([result], { length: 1 }) as unknown as SpeechRecognitionResultList;
+  return { resultIndex: 0, results } as unknown as SpeechRecognitionEvent;
+}
+
 describe('VoiceRecorder', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    lastRecognitionInstance = null;
     // Reset speech recognition APIs before each test
     delete (window as WindowWithSpeechRecognition).SpeechRecognition;
     delete (window as WindowWithSpeechRecognition).webkitSpeechRecognition;
@@ -111,5 +128,93 @@ describe('VoiceRecorder', () => {
     fireEvent.click(button);
 
     expect(onStart).toHaveBeenCalledTimes(1);
+  });
+
+  it('Stop button is absent before recording starts', () => {
+    (window as WindowWithSpeechRecognition).SpeechRecognition = MockSpeechRecognition;
+
+    render(<VoiceRecorder {...defaultProps} />);
+
+    expect(screen.queryByRole('button', { name: /stop recording/i })).not.toBeInTheDocument();
+  });
+
+  it('Stop button appears when recording is active', () => {
+    (window as WindowWithSpeechRecognition).SpeechRecognition = MockSpeechRecognition;
+
+    render(<VoiceRecorder {...defaultProps} />);
+
+    const startButton = screen.getByRole('button', { name: /start recording/i });
+    fireEvent.click(startButton);
+
+    expect(screen.getByRole('button', { name: /stop recording/i })).toBeInTheDocument();
+  });
+
+  it('Stop with non-empty interim submits interim as transcript', () => {
+    (window as WindowWithSpeechRecognition).SpeechRecognition = MockSpeechRecognition;
+
+    const onTranscript = jest.fn<(transcript: string) => void>();
+    const onError = jest.fn<(message: string) => void>();
+    render(<VoiceRecorder {...defaultProps} onTranscript={onTranscript} onError={onError} />);
+
+    // Click Start to begin recording
+    const startButton = screen.getByRole('button', { name: /start recording/i });
+    fireEvent.click(startButton);
+
+    const recognition = lastRecognitionInstance!;
+
+    // Simulate an interim onresult event — this sets currentInterim state
+    act(() => {
+      recognition.onresult!(makeSpeechResultEvent('Hello world', false));
+    });
+
+    // Click Stop — should submit the interim text as the transcript
+    const stopButton = screen.getByRole('button', { name: /stop recording/i });
+    fireEvent.click(stopButton);
+
+    expect(onTranscript).toHaveBeenCalledWith('Hello world');
+    expect(onError).not.toHaveBeenCalled();
+  });
+
+  it('Stop with empty interim calls onError', () => {
+    (window as WindowWithSpeechRecognition).SpeechRecognition = MockSpeechRecognition;
+
+    const onError = jest.fn<(message: string) => void>();
+    render(<VoiceRecorder {...defaultProps} onError={onError} />);
+
+    // Click Start without firing any onresult event
+    const startButton = screen.getByRole('button', { name: /start recording/i });
+    fireEvent.click(startButton);
+
+    // Click Stop with no interim text
+    const stopButton = screen.getByRole('button', { name: /stop recording/i });
+    fireEvent.click(stopButton);
+
+    expect(onError).toHaveBeenCalledWith('Please say something before submitting.');
+  });
+
+  it('onend does not call onError when stopWithNoInterimRef is set', () => {
+    (window as WindowWithSpeechRecognition).SpeechRecognition = MockSpeechRecognition;
+
+    const onError = jest.fn<(message: string) => void>();
+    render(<VoiceRecorder {...defaultProps} onError={onError} />);
+
+    // Click Start
+    const startButton = screen.getByRole('button', { name: /start recording/i });
+    fireEvent.click(startButton);
+
+    // Click Stop with empty interim — sets stopWithNoInterimRef and calls onError once
+    const stopButton = screen.getByRole('button', { name: /stop recording/i });
+    fireEvent.click(stopButton);
+
+    expect(onError).toHaveBeenCalledTimes(1);
+
+    // Simulate recognition.onend firing after stop
+    const recognition = lastRecognitionInstance!;
+    act(() => {
+      recognition.onend!();
+    });
+
+    // onError should still only have been called once (not again from onend)
+    expect(onError).toHaveBeenCalledTimes(1);
   });
 });

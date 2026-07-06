@@ -57,4 +57,18 @@ describe('TranscriptView', () => {
       screen.getByText('I have 5 years of experience in software engineering.')
     ).toBeInTheDocument();
   });
+
+  it('when variant="dark", turn content <p> has class text-zinc-200', () => {
+    render(<TranscriptView turns={[aiTurn]} variant="dark" />);
+    const contentParagraph = screen.getByText('Tell me about yourself.');
+    expect(contentParagraph.className).toContain('text-zinc-200');
+    expect(contentParagraph.className).not.toContain('text-zinc-900');
+  });
+
+  it('when variant="light" (or omitted), turn content <p> has class text-zinc-900', () => {
+    render(<TranscriptView turns={[aiTurn]} variant="light" />);
+    const contentParagraph = screen.getByText('Tell me about yourself.');
+    expect(contentParagraph.className).toContain('text-zinc-900');
+    expect(contentParagraph.className).not.toContain('text-zinc-200');
+  });
 });

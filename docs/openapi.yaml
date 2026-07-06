@@ -540,17 +540,22 @@ paths:
         - cookieAuth: []
       description: |
         Accepts the candidate's spoken answer for the current turn. Validates the session
-        is IN_PROGRESS, persists two Turn rows (AI question + user answer) in a single
-        transaction, and returns a hardcoded next question. The `turnNumber` field is used
-        to index into the server-side placeholder question list; out-of-bounds indices fall
-        back to index 0.
+        is IN_PROGRESS, saves the user answer turn (and the initial AI question turn if
+        this is the first call for the session), then makes a synchronous (non-streaming)
+        call to the Claude API to generate the next interview question. Returns a structured
+        JSON response containing the next question, a completion flag, and a `decisionState`
+        block describing the AI's current understanding of the interview coverage.
+
+        If `isComplete` is true, the session is also marked as COMPLETED in the database.
+
+        The `turnNumber` field is silently ignored if present in the request body.
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [sessionId, userAnswer, turnNumber]
+              required: [sessionId, userAnswer, currentQuestion]
               properties:
                 sessionId:
                   type: string
@@ -558,25 +563,69 @@ paths:
                 userAnswer:
                   type: string
                   example: I have 5 years of experience building distributed systems.
-                turnNumber:
-                  type: integer
-                  minimum: 0
-                  example: 0
+                currentQuestion:
+                  type: string
+                  example: "Tell me about your experience with TypeScript."
       responses:
         '200':
-          description: Turn persisted. Returns the next question and a completion flag.
+          description: |
+            Turn persisted and Claude responded. Returns the next question, a completion
+            flag, and the AI decision state reflecting the current interview coverage.
           content:
             application/json:
               schema:
                 type: object
-                required: [nextQuestion, isComplete]
+                required: [nextQuestion, isComplete, decisionState]
                 properties:
                   nextQuestion:
                     type: string
-                    example: "Thank you. Can you walk me through a specific challenge you faced in a previous role and how you resolved it?"
+                    example: "You mentioned distributed systems — can you walk me through how you'd design a rate limiter?"
                   isComplete:
                     type: boolean
                     example: false
+                  decisionState:
+                    type: object
+                    required: [detectedSkills, coveredTopics, remainingGaps, questionRationale]
+                    properties:
+                      detectedSkills:
+                        type: array
+                        items:
+                          type: string
+                        example: ["TypeScript", "API Design"]
+                      coveredTopics:
+                        type: array
+                        items:
+                          type: string
+                        example: ["Background", "Technical Experience"]
+                      remainingGaps:
+                        type: array
+                        items:
+                          type: string
+                        example: ["System Design", "Team Collaboration"]
+                      questionRationale:
+                        type: string
+                        example: "Candidate demonstrated TypeScript fluency. Probing system design gap next."
+              examples:
+                inProgress:
+                  summary: Interview still in progress
+                  value:
+                    nextQuestion: "You mentioned distributed systems — can you walk me through how you'd design a rate limiter?"
+                    isComplete: false
+                    decisionState:
+                      detectedSkills: ["TypeScript", "API Design"]
+                      coveredTopics: ["Background", "Technical Experience"]
+                      remainingGaps: ["System Design", "Team Collaboration"]
+                      questionRationale: "Candidate demonstrated TypeScript fluency. Probing system design gap next."
+                complete:
+                  summary: Interview complete
+                  value:
+                    nextQuestion: "Thank you for your time today. We've covered all the key areas — we'll be in touch with next steps."
+                    isComplete: true
+                    decisionState:
+                      detectedSkills: ["TypeScript", "API Design", "System Design", "Team Collaboration"]
+                      coveredTopics: ["Background", "Technical Experience", "System Design", "Collaboration & Leadership"]
+                      remainingGaps: []
+                      questionRationale: "All required skills have been assessed and at least 6 questions asked. Closing the interview."
         '400':
           description: Validation error — missing or invalid field.
           content:
@@ -587,7 +636,7 @@ paths:
                 properties:
                   error:
                     type: string
-                    example: "sessionId, userAnswer, and turnNumber are required"
+                    example: "sessionId, userAnswer, and currentQuestion are required"
         '404':
           description: Session not found.
           content:
@@ -620,7 +669,15 @@ paths:
                 properties:
                   error:
                     type: string
-                    example: "Internal server error"
+              examples:
+                aiUnavailable:
+                  summary: Claude API call failed or response could not be parsed
+                  value:
+                    error: "AI service unavailable. Please try again."
+                internalError:
+                  summary: Any other unexpected server error
+                  value:
+                    error: "Internal server error"
 
   /api/sessions/{sessionId}:
     patch:
@@ -733,6 +790,125 @@ paths:
                   error:
                     type: string
                     example: "Session is not in progress"
+        '500':
+          description: Unexpected server error.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+                    example: "Internal server error"
+
+  /api/evaluate:
+    post:
+      summary: Generate and persist a structured evaluation for a completed interview session
+      operationId: evaluateSession
+      tags: [evaluate]
+      description: |
+        Accepts a `sessionId`, loads all Turn rows for the session, and sends the full
+        transcript to the AI provider (via `aiClient.complete`) to produce a structured
+        evaluation. The AI response is expected to be a JSON object with `strengths`,
+        `concerns`, and `overall_score` keys. Markdown fences are stripped before parsing.
+
+        The resulting Evaluation row is persisted and the session is marked COMPLETED
+        (with `endedAt` set) if it was not already. Returns the new evaluation record.
+
+        Returns 409 if the session is ABANDONED or if an evaluation already exists.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sessionId]
+              properties:
+                sessionId:
+                  type: string
+                  example: clyyyy
+      responses:
+        '201':
+          description: Evaluation created and persisted successfully.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, strengths, concerns, score]
+                properties:
+                  id:
+                    type: string
+                    example: cleval000000000000000001
+                  strengths:
+                    type: array
+                    items:
+                      type: string
+                    example: ["Strong TypeScript fundamentals", "Clear communication"]
+                  concerns:
+                    type: array
+                    items:
+                      type: string
+                    example: ["Limited system design experience", "Shallow testing knowledge"]
+                  score:
+                    type: integer
+                    minimum: 1
+                    maximum: 10
+                    example: 7
+        '400':
+          description: Validation error — sessionId is missing or empty.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+                    example: "sessionId is required"
+        '404':
+          description: No session found with the provided sessionId.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+                    example: "Session not found"
+        '409':
+          description: |
+            Conflict — either the session is ABANDONED and cannot be evaluated,
+            or an evaluation already exists for this session.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+              examples:
+                sessionAbandoned:
+                  summary: Session status is ABANDONED
+                  value:
+                    error: "Session is not in progress or completed"
+                evaluationExists:
+                  summary: Evaluation row already exists for this session
+                  value:
+                    error: "Evaluation already exists"
+        '502':
+          description: AI provider returned an unparseable or malformed evaluation response.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+                    example: "AI returned an unparseable evaluation"
         '500':
           description: Unexpected server error.
           content:

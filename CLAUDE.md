@@ -190,6 +190,6 @@ All new API endpoints must be documented in `docs/openapi.yaml` by the `backend-
 
 - `SpeechRecognition` is Chrome/Edge-only; show a clear unsupported-browser warning on Firefox/Safari.
 - Voice capture must be gated behind explicit user gesture (microphone button) — autoplay policy blocks otherwise.
-- Use streaming (`stream: true`) from the Anthropic SDK on `/api/interview` and pipe with `ReadableStream` so the first words of the AI question appear quickly.
+- `POST /api/interview` uses a synchronous (non-streaming) Anthropic call returning structured JSON (`{ question, isComplete, decisionState }`); streaming is reserved for future plain-text-only endpoints.
 - The interview state machine lives in `InterviewRoom.tsx` as a `useReducer`; do not split it across multiple components.
 - Evaluation JSON must be parsed defensively — Claude occasionally wraps it in markdown code fences; strip before `JSON.parse`.

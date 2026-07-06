@@ -12,3 +12,4 @@ Updated automatically by the orchestrator when a feature is complete.
 | job-listing-dashboard | 2026-07-05 | [spec](sdd/job-listing-dashboard/feature-spec.md) | [plan](sdd/job-listing-dashboard/implementation-plan.md) |
 | openrouter-integration | 2026-07-05 | [spec](sdd/openrouter-integration/feature-spec.md) | [plan](sdd/openrouter-integration/implementation-plan.md) |
 | video-call-aesthetic | 2026-07-05 | [spec](sdd/video-call-aesthetic/feature-spec.md) | [plan](sdd/video-call-aesthetic/implementation-plan.md) |
+| decision-panel | 2026-07-05 | [spec](sdd/decision-panel/feature-spec.md) | [plan](sdd/decision-panel/implementation-plan.md) |

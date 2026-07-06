@@ -79,12 +79,13 @@ enum SessionStatus {
 }
 
 model Turn {
-  id        String   @id @default(cuid())
-  sessionId String   @map("session_id")
-  session   Session  @relation(fields: [sessionId], references: [id])
-  speaker   Speaker
-  content   String
-  createdAt DateTime @default(now()) @map("created_at")
+  id            String   @id @default(cuid())
+  sessionId     String   @map("session_id")
+  session       Session  @relation(fields: [sessionId], references: [id])
+  speaker       Speaker
+  content       String
+  decisionState Json?    @map("decision_state")
+  createdAt     DateTime @default(now()) @map("created_at")
 
   @@map("turns")
 }

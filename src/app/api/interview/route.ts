@@ -1,23 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { Prisma } from '@/generated/prisma/client';
 import { prisma } from '@/lib/prisma';
-import type { PostInterviewResponse, ApiErrorResponse } from '@/types';
+import { buildInterviewSystemPrompt, callClaudeForNextQuestion } from '@/lib/anthropic';
+import type { PostInterviewResponse, ApiErrorResponse, ClaudeInterviewResponse } from '@/types';
 
-const PLACEHOLDER_QUESTIONS: readonly string[] = [
-  "Welcome! Please start by telling me about yourself and your background.",
-  "Can you describe a challenging project you've worked on recently?",
-  "How do you approach debugging a complex issue in production?",
-  "Tell me about a time you disagreed with a team member. How did you handle it?",
-  "How do you prioritize tasks when you have multiple deadlines?",
-  "What are you most proud of in your career so far?",
-  "Do you have any questions for us?",
-] as const;
-
-const NEXT_QUESTION =
-  "Thank you. Can you walk me through a specific challenge you faced in a previous role and how you resolved it?";
-
-export async function POST(
-  request: NextRequest
-): Promise<NextResponse<PostInterviewResponse | ApiErrorResponse>> {
+export async function POST(request: NextRequest): Promise<Response> {
   try {
     const body: unknown = await request.json();
 
@@ -28,62 +15,147 @@ export async function POST(
       !(body as Record<string, unknown>).sessionId ||
       typeof (body as Record<string, unknown>).userAnswer !== 'string' ||
       !(body as Record<string, unknown>).userAnswer ||
-      !Number.isInteger((body as Record<string, unknown>).turnNumber) ||
-      ((body as Record<string, unknown>).turnNumber as number) < 0
+      typeof (body as Record<string, unknown>).currentQuestion !== 'string' ||
+      !(body as Record<string, unknown>).currentQuestion
     ) {
-      return NextResponse.json(
-        { error: 'sessionId, userAnswer, and turnNumber are required' },
+      return NextResponse.json<ApiErrorResponse>(
+        { error: 'sessionId, userAnswer, and currentQuestion are required' },
         { status: 400 }
       );
     }
 
-    const { sessionId, userAnswer, turnNumber } = body as {
+    const { sessionId, userAnswer, currentQuestion } = body as {
       sessionId: string;
       userAnswer: string;
-      turnNumber: number;
+      currentQuestion: string;
     };
 
-    const session = await prisma.session.findUnique({ where: { id: sessionId } });
+    const session = await prisma.session.findUnique({
+      where: { id: sessionId },
+      include: { job: { include: { skills: true } } },
+    });
 
     if (!session) {
-      return NextResponse.json(
+      return NextResponse.json<ApiErrorResponse>(
         { error: 'Session not found' },
         { status: 404 }
       );
     }
 
     if (session.status !== 'IN_PROGRESS') {
-      return NextResponse.json(
+      return NextResponse.json<ApiErrorResponse>(
         { error: 'Session is not in progress' },
         { status: 409 }
       );
     }
 
-    const questionContent = PLACEHOLDER_QUESTIONS[turnNumber] ?? PLACEHOLDER_QUESTIONS[0];
+    const existingTurns = await prisma.turn.findMany({
+      where: { sessionId },
+      orderBy: { createdAt: 'asc' },
+    });
 
-    await prisma.$transaction([
-      prisma.turn.create({
-        data: {
-          sessionId,
-          speaker: 'AI',
-          content: questionContent,
-        },
-      }),
-      prisma.turn.create({
-        data: {
-          sessionId,
-          speaker: 'USER',
-          content: userAnswer,
-        },
-      }),
-    ]);
+    const hasAiTurns = existingTurns.some((t) => t.speaker === 'AI');
 
-    return NextResponse.json(
-      { nextQuestion: NEXT_QUESTION, isComplete: false },
-      { status: 200 }
+    // Build conversation history from existing turns
+    const conversationHistory: Array<{ role: 'user' | 'assistant'; content: string }> =
+      existingTurns.map((turn) => ({
+        role: (turn.speaker === 'AI' ? 'assistant' : 'user') as 'user' | 'assistant',
+        content: turn.content,
+      }));
+
+    // On first call, prepend the initial AI question that was shown to the candidate
+    if (!hasAiTurns) {
+      conversationHistory.unshift({ role: 'assistant', content: currentQuestion });
+    }
+
+    // Always append the candidate's current answer as the last message
+    conversationHistory.push({ role: 'user', content: userAnswer });
+
+    // Deduplication guard (retry safety)
+    const lastTurn = existingTurns[existingTurns.length - 1];
+    const userAnswerAlreadySaved =
+      lastTurn?.speaker === 'USER' && lastTurn?.content === userAnswer;
+
+    // Save user answer (pre-Claude) — skip if already saved on a prior retry
+    if (!userAnswerAlreadySaved) {
+      if (!hasAiTurns) {
+        // First turn: also save the initial AI question before the user answer
+        await prisma.$transaction([
+          prisma.turn.create({
+            data: {
+              sessionId,
+              speaker: 'AI',
+              content: currentQuestion,
+              decisionState: Prisma.JsonNull,
+            },
+          }),
+          prisma.turn.create({
+            data: { sessionId, speaker: 'USER', content: userAnswer },
+          }),
+        ]);
+      } else {
+        await prisma.$transaction([
+          prisma.turn.create({
+            data: { sessionId, speaker: 'USER', content: userAnswer },
+          }),
+        ]);
+      }
+    }
+
+    // Build the system prompt and call Claude
+    const systemPrompt = buildInterviewSystemPrompt(
+      session.job.title,
+      session.job.description,
+      session.job.skills
     );
+
+    let claudeResponse: ClaudeInterviewResponse;
+    try {
+      claudeResponse = await callClaudeForNextQuestion(systemPrompt, conversationHistory);
+    } catch {
+      // Do NOT roll back user turn saves — they reflect real candidate answers
+      return NextResponse.json<ApiErrorResponse>(
+        { error: 'AI service unavailable. Please try again.' },
+        { status: 500 }
+      );
+    }
+
+    // Save Claude's AI turn and optionally mark session as completed
+    if (claudeResponse.isComplete) {
+      await prisma.$transaction([
+        prisma.turn.create({
+          data: {
+            sessionId,
+            speaker: 'AI',
+            content: claudeResponse.question,
+            decisionState: claudeResponse.decisionState as object,
+          },
+        }),
+        prisma.session.update({
+          where: { id: sessionId },
+          data: { status: 'COMPLETED', endedAt: new Date() },
+        }),
+      ]);
+    } else {
+      await prisma.$transaction([
+        prisma.turn.create({
+          data: {
+            sessionId,
+            speaker: 'AI',
+            content: claudeResponse.question,
+            decisionState: claudeResponse.decisionState as object,
+          },
+        }),
+      ]);
+    }
+
+    return NextResponse.json<PostInterviewResponse>({
+      nextQuestion: claudeResponse.question,
+      isComplete: claudeResponse.isComplete,
+      decisionState: claudeResponse.decisionState,
+    });
   } catch {
-    return NextResponse.json(
+    return NextResponse.json<ApiErrorResponse>(
       { error: 'Internal server error' },
       { status: 500 }
     );

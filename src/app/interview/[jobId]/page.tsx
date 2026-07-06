@@ -45,7 +45,7 @@ export default async function InterviewPage({
   };
 
   return (
-    <main className="min-h-screen bg-zinc-950 text-white flex flex-col">
+    <main className="min-h-screen bg-zinc-950 text-white flex flex-col max-w-5xl mx-auto w-full">
       <InterviewRoom job={jobForClient} />
     </main>
   );

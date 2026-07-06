@@ -99,6 +99,7 @@ export interface InterviewRoomState {
   errorMessage: string | null;
   interimTranscript: string;
   retryCount: number;
+  decisionState: DecisionState | null;
 }
 
 export type InterviewRoomAction =
@@ -107,7 +108,7 @@ export type InterviewRoomAction =
   | { type: 'RECORDING_STARTED' }
   | { type: 'INTERIM_TRANSCRIPT'; text: string }
   | { type: 'FINAL_TRANSCRIPT'; transcript: string; currentQuestion: string }
-  | { type: 'TURN_SAVED'; nextQuestion: string; isComplete: boolean }
+  | { type: 'TURN_SAVED'; nextQuestion: string; isComplete: boolean; decisionState: DecisionState | null }
   | { type: 'API_ERROR'; message: string }
   | { type: 'RETRY_SESSION' }
   | { type: 'RETRY_TURN' };
@@ -119,4 +120,24 @@ export interface PostSessionResponse {
 export interface PostInterviewResponse {
   nextQuestion: string;
   isComplete: boolean;
+  decisionState: DecisionState;
+}
+
+export interface PostInterviewSuccessResponse {
+  nextQuestion: string;
+  isComplete: boolean;
+  decisionState: DecisionState | null;
+}
+
+export interface DecisionState {
+  detectedSkills: string[];
+  coveredTopics: string[];
+  remainingGaps: string[];
+  questionRationale: string;
+}
+
+export interface ClaudeInterviewResponse {
+  question: string;
+  isComplete: boolean;
+  decisionState: DecisionState;
 }
