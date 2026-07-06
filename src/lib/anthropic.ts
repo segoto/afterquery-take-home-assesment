@@ -1,12 +1,5 @@
-import Anthropic from '@anthropic-ai/sdk';
 import type { ClaudeInterviewResponse, DecisionState } from '@/types';
-
-/**
- * Anthropic client singleton.
- * Created once at module-load time — never reinstantiated per request.
- * Server-only: this file must NOT be imported from Client Components.
- */
-export const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+import { aiClient } from '@/lib/ai-client';
 
 /**
  * Sentinel token used by the legacy streaming interview prompt.
@@ -141,22 +134,7 @@ export async function callClaudeForNextQuestion(
   systemPrompt: string,
   conversationHistory: Array<{ role: 'user' | 'assistant'; content: string }>
 ): Promise<ClaudeInterviewResponse> {
-  const response = await anthropic.messages.create({
-    model: 'claude-sonnet-4-6',
-    max_tokens: 1024,
-    stream: false,
-    system: systemPrompt,
-    messages: conversationHistory,
-  });
-
-  const firstBlock = response.content[0];
-  if (!firstBlock || firstBlock.type !== 'text') {
-    throw new Error(
-      'Unexpected Claude response: expected a text content block but received none'
-    );
-  }
-
-  const raw: string = firstBlock.text;
+  const raw = await aiClient.complete({ systemPrompt, messages: conversationHistory });
 
   // Defensive fence-stripping: Claude occasionally wraps JSON in markdown fences
   const clean = raw.replace(/^```json\n?/, '').replace(/\n?```$/, '').trim();
