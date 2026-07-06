@@ -1,36 +1,107 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# AI Interviewer Platform
 
-## Getting Started
+A full-stack AI-powered interview platform where candidates select a job and complete a voice-driven AI interview. The AI asks at least 6 questions — including adaptive follow-ups based on prior answers — then generates a structured evaluation at the end.
 
-First, run the development server:
+## Tech stack
+
+- **Framework**: Next.js 16 (App Router, TypeScript)
+- **Styling**: Tailwind CSS v4
+- **AI**: Anthropic Claude (`claude-sonnet-4-6`) or OpenRouter
+- **Voice I/O**: Web Speech API (Chrome/Edge only)
+- **Database**: PostgreSQL via Prisma ORM
+- **Auth**: JWT (jose + bcryptjs)
+
+## Prerequisites
+
+- Node.js 18+
+- PostgreSQL 14+ **or** Docker
+- An Anthropic API key (or an OpenRouter API key)
+
+## Running locally
+
+### 1. Install dependencies
+
+```bash
+npm install
+```
+
+### 2. Set up environment variables
+
+```bash
+cp .env.example .env
+```
+
+Fill in the required values in `.env`:
+
+| Variable | Required | Description |
+|---|---|---|
+| `DATABASE_URL` | Yes | PostgreSQL connection string |
+| `ANTHROPIC_API_KEY` | Yes (default) | Anthropic API key |
+| `AI_PROVIDER` | No | `anthropic` (default) or `openrouter` |
+| `OPENROUTER_API_KEY` | If using OpenRouter | OpenRouter API key |
+| `OPENROUTER_MODEL` | No | Defaults to `anthropic/claude-sonnet-4-6` |
+| `OPENROUTER_FOLLOWUP_MODEL` | No | Defaults to `meta-llama/llama-3.1-8b-instruct` |
+| `JWT_SECRET` | Yes | At least 32 characters in production |
+| `NEXT_PUBLIC_APP_URL` | No | Defaults to `http://localhost:3000` |
+
+### 3. Start the database
+
+**Option A — Docker (recommended)**
+
+```bash
+docker compose up -d
+```
+
+The `docker-compose.yml` reads `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, and `POSTGRES_PORT` from `.env`. Add those to your `.env` to match your `DATABASE_URL`, for example:
+
+```env
+POSTGRES_USER=user
+POSTGRES_PASSWORD=password
+POSTGRES_DB=ai_interviewer
+POSTGRES_PORT=5432
+DATABASE_URL="postgresql://user:password@localhost:5432/ai_interviewer?schema=public"
+```
+
+**Option B — existing PostgreSQL**
+
+Point `DATABASE_URL` at your running instance.
+
+### 4. Run database migrations and seed
+
+```bash
+npx prisma migrate deploy
+npx prisma db seed
+```
+
+### 5. Start the dev server
 
 ```bash
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open [http://localhost:3000](http://localhost:3000) in **Chrome or Edge** (voice capture requires Web Speech API).
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Application flow
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+1. **Sign up / log in** at `/signup` or `/login`
+2. **Pick a job** from the listing page (`/`)
+3. **Complete the interview** — the AI asks questions via text-to-speech; you answer with your microphone
+4. **View results** — transcript and structured evaluation at `/results/[sessionId]`
 
-## Learn More
+## Available scripts
 
-To learn more about Next.js, take a look at the following resources:
+```bash
+npm run dev        # Start dev server (http://localhost:3000)
+npm run build      # Production build
+npm run start      # Start production server
+npm run lint       # ESLint
+npm test           # Jest test suite
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+npx prisma studio          # Visual DB browser
+npx prisma migrate dev --name <name>  # Create a new migration (dev)
+npx prisma migrate reset   # Drop and re-run all migrations (dev only — destructive)
+```
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+## Browser compatibility
 
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+Voice input uses the Web Speech API which is supported on **Chrome and Edge only**. A browser warning is shown on Firefox and Safari.
